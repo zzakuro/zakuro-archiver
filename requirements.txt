@@ -1,0 +1,4 @@
+# scrapling drives the browser that clears vikingfile's Cloudflare
+# challenge. The [all] extra is the one that brings the engines -- a plain
+# `pip install scrapling` installs a package whose fetchers cannot import.
+scrapling[all]>=0.4.15

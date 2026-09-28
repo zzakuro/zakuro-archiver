@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv*/
+out/
+work/
+*.rar
+*.7z
+*.zip
+*.download.*
+.git/

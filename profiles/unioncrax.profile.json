@@ -1,0 +1,11 @@
+{
+  "remove": [
+    "Online"
+  ],
+  "add": [],
+  "level": "normal",
+  "archiver": "",
+  "output_dir": "",
+  "keep_download": false,
+  "work_dir": ""
+}
