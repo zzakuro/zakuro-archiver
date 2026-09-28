@@ -715,6 +715,122 @@ def _raises(fn) -> bool:
     return False
 
 
+def _edit_checks(checks) -> None:
+    """What --remove and --add actually do to a folder.
+
+    These exist because the suite went 114 checks without ever performing a
+    real (non-dry-run) add. An indentation slip left the whole copy body
+    inside the `if dry_run:` block after its `continue`, so every add reported
+    the file it had placed and copied nothing, and every check still passed.
+    A test that only dry-runs an edit is not testing the edit.
+    """
+    import shutil as _shutil
+    from pathlib import Path as _Path
+
+    def blank(spec=None):
+        root = _Path(tempfile.mkdtemp(prefix="uc-edit-"))
+        for rel, body in (spec or {}).items():
+            p = root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(body, encoding="utf-8")
+        return root
+
+    # -- remove: every occurrence, at any depth ------------------------
+    d = blank({"Game.exe": "x", "Online/a.dat": "x", "bin/Online/b.txt": "x",
+               "a/b/c/Online/deep.bin": "x", "bin/keep.dat": "x"})
+    gone = uc.remove_matches(d, ["Online"])
+    left = sorted(p.relative_to(d).as_posix() for p in d.rglob("*") if p.is_file())
+    checks.check("remove: one name takes every occurrence at every depth",
+                 left == ["Game.exe", "bin/keep.dat"], str(left))
+    checks.check("remove: and reports all of them", len(gone) == 6, str(gone))
+    _shutil.rmtree(d, ignore_errors=True)
+
+    # -- remove: case, on any platform ---------------------------------
+    d = blank({"Online/a.txt": "x", "online/b.txt": "x", "ONLINE/c.txt": "x"})
+    uc.remove_matches(d, ["Online"])
+    left = [p for p in d.rglob("*") if p.is_file()]
+    checks.check("remove: matching ignores case, as it does on Windows", not left,
+                 str([p.name for p in left]))
+    checks.check("remove: and does not lean on normcase to do it",
+                 uc._norm("ONLINE") == "online", uc._norm("ONLINE"))
+    _shutil.rmtree(d, ignore_errors=True)
+
+    # -- remove: a backslash pattern means the same thing ----------------
+    for written in ("Redist\\", "Redist/", "Redist"):
+        d = blank({"Redist/a.exe": "x", "keep.exe": "x"})
+        uc.remove_matches(d, [written])
+        left = sorted(p.relative_to(d).as_posix() for p in d.rglob("*") if p.is_file())
+        checks.check(f"remove: the pattern {written!r} removes the folder",
+                     left == ["keep.exe"], str(left))
+        _shutil.rmtree(d, ignore_errors=True)
+
+    # -- add: a real add, not a dry run ---------------------------------
+    src = _Path(tempfile.mkdtemp(prefix="uc-src-"))
+    (src / "payload" / "sub").mkdir(parents=True)
+    (src / "payload" / "one.dll").write_text("1", encoding="utf-8")
+    (src / "payload" / "sub" / "two.dll").write_text("2", encoding="utf-8")
+    (src / "steam_api64.dll").write_text("the new dll", encoding="utf-8")
+
+    d = blank({"game.exe": "x"})
+    got = uc.add_files(d, [str(src / "steam_api64.dll")])
+    checks.check("add: a bare file is really copied, not just reported",
+                 (d / "steam_api64.dll").is_file()
+                 and (d / "steam_api64.dll").read_text() == "the new dll", str(got))
+    _shutil.rmtree(d, ignore_errors=True)
+
+    d = blank()
+    got = uc.add_files(d, [str(src / "payload")])
+    checks.check("add: a folder comes in whole, recursively",
+                 got == ["payload"]
+                 and (d / "payload" / "one.dll").is_file()
+                 and (d / "payload" / "sub" / "two.dll").is_file(), str(got))
+    _shutil.rmtree(d, ignore_errors=True)
+
+    # -- add: over the two shapes it can land on ------------------------
+    d = blank({"steam_api64.dll": "the old dll"})
+    uc.add_files(d, [str(src / "steam_api64.dll")])
+    checks.check("add: a file replaces a file of the same name",
+                 (d / "steam_api64.dll").read_text() == "the new dll",
+                 (d / "steam_api64.dll").read_text())
+    _shutil.rmtree(d, ignore_errors=True)
+
+    d = blank({"payload": "i am a file"})
+    try:
+        got = uc.add_files(d, [str(src / "payload")])
+        ok = (d / "payload").is_dir() and (d / "payload" / "one.dll").is_file()
+    except SystemExit as exc:
+        got, ok = str(exc), False
+    checks.check("add: a folder replaces a file of the same name", ok, str(got))
+    _shutil.rmtree(d, ignore_errors=True)
+
+    d = blank({"steam_api64.dll/inner.txt": "i am a directory"})
+    got = uc.add_files(d, [str(src / "steam_api64.dll")])
+    left = sorted(p.relative_to(d).as_posix() for p in d.rglob("*"))
+    checks.check("add: a file replaces a folder of the same name, not into it",
+                 left == ["steam_api64.dll"], f"{got} left {left}")
+    _shutil.rmtree(d, ignore_errors=True)
+
+    # -- add: a target may be a path, and may not escape ----------------
+    d = blank({"game.exe": "x"})
+    got = uc.add_files(d, [f"bin/x64/steam_api64.dll={src / 'steam_api64.dll'}"])
+    checks.check("add: NAME= can place a file in a sub folder",
+                 got == ["bin/x64/steam_api64.dll"]
+                 and (d / "bin" / "x64" / "steam_api64.dll").is_file(), str(got))
+    _shutil.rmtree(d, ignore_errors=True)
+
+    d = blank({"game.exe": "x"})
+    got = uc.add_files(d, [f"redist\\stuff={src / 'payload'}"])
+    checks.check("add: a backslash in NAME= works too",
+                 got == ["redist/stuff"], str(got))
+    _shutil.rmtree(d, ignore_errors=True)
+
+    for escape in ("../outside.dll", "..\\outside.dll", "/etc/passwd", "C:/x.dll"):
+        checks.check(f"add: {escape!r} as a target is refused",
+                     not uc._is_inside_target(escape))
+    checks.check("add: a plain name is inside", uc._is_inside_target("steam_api64.dll"))
+    _shutil.rmtree(src, ignore_errors=True)
+
+
 def main() -> int:
     checks = Checks()
     run(checks)
@@ -725,6 +841,7 @@ def main() -> int:
     _no_return_in_finally_checks(checks)
     _free_space_checks(checks)
     _download_totals_checks(checks)
+    _edit_checks(checks)
     total = checks.passed + checks.failed
     print(f"uc-archiver selftest: {checks.passed} passed, {checks.failed} failed")
     return 1 if checks.failed else 0

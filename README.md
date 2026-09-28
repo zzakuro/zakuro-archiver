@@ -42,6 +42,56 @@ rather than a regex on purpose: the host has already moved domain once
 (`vikingfile.com` → `vik1ngfile.site`) and the download path has changed shape
 before.
 
+## What --remove and --add match
+
+**`--remove` takes every match, at any depth.** One name, all of them:
+
+```bash
+python uc_archiver.py catalogue.json --pick 243 --remove Online
+```
+
+```
+- Online/launcher.dat          (top level)
+- bin/Online/                  (nested)
+- a/b/c/Online/deep.bin        (deeply nested)
+```
+
+A pattern is matched against the path relative to the game folder, against
+the bare name, and against each part of the path in turn, so all of these work
+and none of them needs a wildcard:
+
+| Written | Takes |
+| --- | --- |
+| `Online` | every `Online` folder or file, at any depth, and everything inside a matching folder |
+| `*.dll` | every `.dll` at any depth |
+| `Redist` | the `Redist` folder and its whole tree |
+| `T98\` or `T98/` | the same, with a trailing separator |
+
+Matching ignores case **on every platform**. That is deliberate: `fnmatch`
+alone folds case through `os.path.normcase`, which lowercases on Windows and
+does nothing on Linux, so a profile written on Windows would have removed
+`online` and `ONLINE` there and only `Online` in the container — the same
+release, two different answers.
+
+**`--add` copies whole folders, and can put them anywhere inside the game.**
+
+```bash
+--add "D:/patches/steam_api64.dll"            # keeps its name, lands at the root
+--add "bin/redist=D:/patches/redist"         # a folder, into bin/redist/
+--add "bin\x64\steam_api64.dll=D:/p/..."   # backslashes work the same
+```
+
+A folder source is copied recursively, so pointing at a prepared `redist/`
+brings the lot. Anything that would climb out of the game folder — `..`, a
+leading `/`, a `C:` drive — is refused, because a target is a place inside
+the tree and not anywhere on the disk.
+
+Replacing works in both directions and says what it did: a file over a file
+replaces it, a file over a folder replaces the folder, and a folder over
+either replaces it. Adding a file onto a folder used to land *inside* it
+(`steam_api64.dll/steam_api64.dll`) and leave the folder there, which is the
+kind of thing that only shows up as a game that will not start.
+
 ## Do not trust the catalogue's sizes
 
 It is out by a lot, and it is not a systematic relationship:
@@ -150,7 +200,7 @@ writable layer.
 python selftest.py
 ```
 
-114 checks, none of which touch the network or need an archiver. The store is
+133 checks, none of which touch the network or need an archiver. The store is
 faked at the urlopen boundary, the share page at the session boundary, and the
 download at the same, so the parsing is tested — including the case where the
 page gives no link, which has to be a clear error rather than a silently wrong
@@ -164,7 +214,11 @@ Three of them exist because the bug they cover was invisible otherwise:
 - the download checks assert that a complete file passes against an estimate
   that rounds **up**, which is the case an exact comparison fails;
 - free space is checked for returning "unknown" rather than zero, since zero
-  read as "no room" to one caller and "could not tell" to another.
+  read as "no room" to one caller and "could not tell" to another;
+- the edit checks perform a real add rather than a dry run, which is the only
+  reason the one above was caught: an indentation slip had put the entire copy
+  body inside the `if dry_run:` block, so every add reported the file it had
+  placed, copied nothing, and the suite stayed green through it.
 
 ## What it will not do
 

@@ -776,24 +776,48 @@ def screen_entries(names: list[str], what: str = "archive") -> list[str]:
     return names
 
 
+def _norm(value: str) -> str:
+    """One spelling for a path or a pattern, whatever platform wrote it.
+
+    Separators become `/` and case is folded. Both halves matter: a profile
+    written on Windows says `Redist\\stuff` or `Online`, and the container
+    has to answer the same way, or the same release comes out different
+    depending on where it was built.
+
+    A trailing separator is dropped. `Redist\\` is what a hand-written profile
+    on Windows actually says, and leaving it on made the pattern match
+    nothing at all -- `Redist` on its own would not have matched it either
+    way, so a typo like that silently removed nothing and said so.
+    """
+    return value.replace("\\", "/").rstrip("/").lower()
+
+
 def remove_matches(root: Path, patterns: list[str], dry_run: bool = False) -> list[str]:
     """Delete what the patterns name, deepest first.
 
-    A directory match takes its contents with it, so the children are not
-    listed separately afterwards. Patterns are matched against the path
-    relative to the root, with `/` separators, and also against each path
-    component so `logs` takes `logs/old.log` without asking for a wildcard.
+    Every match goes, not the first one found: a library has the same folder
+    at the root and under `bin/` and under `x64/`, and "remove Online" means
+    all of them.
+
+    A pattern matches against the path relative to the root, against the bare
+    name, and against each path component in turn -- so `logs` takes
+    `logs/old.log` without a wildcard, `*.dll` takes them at any depth, and
+    `Redist` takes that folder and everything under it.
+
+    Matching ignores case on every platform. `fnmatch` alone does not: it
+    folds case through `os.path.normcase`, which lowercases on Windows and
+    leaves it alone on Linux, so `Online` would have taken `online` and
+    `ONLINE` in the first and only `Online` in the second.
     """
+    wanted = [_norm(p) for p in patterns if p and p.strip()]
     removed: list[str] = []
     victims: list[Path] = []
     for path in sorted(root.rglob("*"), key=lambda p: len(p.parts), reverse=True):
         if not path.exists():
             continue
-        rel = path.relative_to(root).as_posix()
-        name = path.name
-        for pattern in patterns:
-            if not pattern:
-                continue
+        rel = _norm(path.relative_to(root).as_posix())
+        name = _norm(path.name)
+        for pattern in wanted:
             if (fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(name, pattern)
                     or fnmatch.fnmatch(rel, f"{pattern}/*")
                     or rel == pattern or rel.startswith(f"{pattern}/")
@@ -824,16 +848,40 @@ def split_extra(entry: str) -> tuple[str | None, Path]:
     an `=`. A Windows path may well have one in a directory name, and
     `C:/my=games/thing.exe` split on the first `=` is `C:/my` renamed to
     `games/thing.exe`, which fails on both halves at once.
+
+    The name may be a path, so a file can be put somewhere specific rather
+    than only at the root: `bin/x64/steam_api64.dll=C:/patches/...` is the
+    usual thing to want and used to be refused outright. What is still
+    refused is anything that would climb out of the game folder or name a
+    drive -- a target is a place inside the tree, not anywhere on the disk.
     """
     if "=" in entry:
         name, _, raw = entry.partition("=")
         name, raw = name.strip(), raw.strip()
-        if name and raw and not re.search(r"[/\\:]", name) and Path(raw).exists():
-            return name, Path(raw).expanduser()
+        if name and raw and Path(raw).exists() and _is_inside_target(name):
+            return name.replace("\\", "/").lstrip("./"), Path(raw).expanduser()
     return None, Path(entry).expanduser()
 
 
+def _is_inside_target(name: str) -> bool:
+    """Is this a path that stays inside the game folder?
+
+    Separators are fine -- `bin/x64/thing.dll` is the point of allowing them.
+    Climbing out with `..`, starting at the root, or carrying a drive letter
+    are not, since any of those puts a file somewhere the release is not.
+    """
+    if not name or name.startswith(("/", "\\")) or ":" in name:
+        return False
+    parts = [p for p in name.replace("\\", "/").split("/") if p not in ("", ".")]
+    return bool(parts) and ".." not in parts
+
+
 def add_files(root: Path, entries: list[str], dry_run: bool = False) -> list[str]:
+    """Copy files and whole folders in, honouring `NAME=path`.
+
+    A folder source is copied recursively, so pointing at a prepared
+    `redist/` brings the lot rather than an empty shell.
+    """
     placed: list[str] = []
     for entry in entries:
         name, source = split_extra(entry)
@@ -849,14 +897,23 @@ def add_files(root: Path, entries: list[str], dry_run: bool = False) -> list[str
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
+            # Clear whatever is in the way first, and clear it correctly for
+            # what it is. rmtree on a file raises, which turned "add this
+            # folder" into "WinError 267: the directory name is invalid"; and
+            # copy2 onto an existing directory copies *into* it, which quietly
+            # produced steam_api64.dll/steam_api64.dll and left the directory it
+            # was meant to replace still sitting there.
+            if target.is_symlink() or (target.exists() and not target.is_dir()):
+                target.unlink()
+            elif target.is_dir():
+                shutil.rmtree(target)
             if source.is_dir():
-                if target.exists():
-                    shutil.rmtree(target)
                 shutil.copytree(source, target)
             else:
                 shutil.copy2(source, target)
         except OSError as exc:
             raise SystemExit(f"--add: could not copy {source}: {exc}") from exc
+
         placed.append(target.relative_to(root).as_posix())
     return placed
 
