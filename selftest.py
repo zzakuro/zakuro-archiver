@@ -955,6 +955,65 @@ def _naming_and_sweep_checks(checks) -> None:
         _shutil.rmtree(work, ignore_errors=True)
 
 
+def _inner_folder_checks(checks) -> None:
+    """The folder inside the archive was still branded.
+
+    Renaming the archive was only half of it: unpacked, the release still had
+    somebody else's mark on the folder, and that is the name people see
+    first. Narrow on purpose, though -- renaming a folder the game did not
+    name after its packer would be a surprise in the other direction.
+    """
+    import shutil as _shutil
+    from pathlib import Path as _Path
+
+    def make(spec):
+        root = _Path(tempfile.mkdtemp(prefix="uc-inner-"))
+        for rel in spec:
+            (root / rel).mkdir(parents=True, exist_ok=True)
+            (root / rel / "f.txt").write_text("x", encoding="utf-8")
+        return root
+
+    root = make(["Touhou Luna Nights - UC/data"])
+    got = uc.retag_inner_folder(root, "Touhou Luna Nights [Zakuro]")
+    dirs = sorted(p.name for p in root.iterdir() if p.is_dir())
+    checks.check("inner folder: a branded folder takes the tag",
+                 got == ("Touhou Luna Nights - UC", "Touhou Luna Nights [Zakuro]")
+                 and dirs == ["Touhou Luna Nights [Zakuro]"], f"{got} -> {dirs}")
+    checks.check("inner folder: and its contents came with it",
+                 (root / "Touhou Luna Nights [Zakuro]" / "data" / "f.txt").is_file())
+    _shutil.rmtree(root, ignore_errors=True)
+
+    root = make(["Data/game.exe"])
+    checks.check("inner folder: a folder the game named itself is left alone",
+                 uc.retag_inner_folder(root, "Whatever [Zakuro]") is None
+                 and (root / "Data").is_dir())
+    _shutil.rmtree(root, ignore_errors=True)
+
+    root = make(["One - UC", "Two - UC"])
+    checks.check("inner folder: two of them means neither is the game's folder",
+                 uc.retag_inner_folder(root, "Whatever [Zakuro]") is None
+                 and (root / "One - UC").is_dir() and (root / "Two - UC").is_dir())
+    _shutil.rmtree(root, ignore_errors=True)
+
+    # A wrapper folder with a loose file beside it is still a wrapper, and the
+    # retag runs before anything is added, so this is the real shape.
+    root = make(["Game - UC"])
+    (root / "readme.txt").write_text("x", encoding="utf-8")
+    got = uc.retag_inner_folder(root, "Game [Zakuro]")
+    checks.check("inner folder: a branded folder is retagged even beside a file",
+                 got == ("Game - UC", "Game [Zakuro]")
+                 and (root / "Game [Zakuro]").is_dir(), str(got))
+    _shutil.rmtree(root, ignore_errors=True)
+
+    # A name that would collide is not renamed over the top of something.
+    root = make(["Game - UC"])
+    (root / "Game [Zakuro]").mkdir()
+    checks.check("inner folder: it will not clobber an existing name",
+                 uc.retag_inner_folder(root, "Game [Zakuro]") is None
+                 and (root / "Game - UC").is_dir())
+    _shutil.rmtree(root, ignore_errors=True)
+
+
 def main() -> int:
     checks = Checks()
     run(checks)
@@ -968,6 +1027,7 @@ def main() -> int:
     _edit_checks(checks)
     _standard_add_checks(checks)
     _naming_and_sweep_checks(checks)
+    _inner_folder_checks(checks)
     total = checks.passed + checks.failed
     print(f"uc-archiver selftest: {checks.passed} passed, {checks.failed} failed")
     return 1 if checks.failed else 0

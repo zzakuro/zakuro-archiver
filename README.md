@@ -61,6 +61,30 @@ describes the archive and the catalogue carries a build id:
 host. Only the last path component is ever read, so a host answering with a
 full path cannot steer the name out of the output directory.
 
+## The folder inside
+
+Renaming the archive was only half of it. These archives wrap the game in a
+folder named after whoever packed it, so unpacked, the release still carried
+somebody else's mark — and that is the name people see first.
+
+```
+Touhou Luna Nights - UC/touhou_luna_nights.exe   ->  Touhou Luna Nights [Zakuro]/…
+```
+
+The folder inside now takes the same name as the archive around it. Narrow on
+purpose:
+
+- only when the archive unpacks to **one** top-level folder — several folders
+  means the game's own layout, not a wrapper
+- only when stripping `UC` actually changes the name, so a game whose own
+  folder is called `Data` or `bin` is left alone
+- never over the top of something that already has that name
+
+It runs immediately after unpacking, before anything is added. That is the
+only point where the game's folder is alone: a moment later `~Common Redist`
+is beside it, there are two top-level directories, and a check for "exactly
+one" would decline to touch either.
+
 ## What gets swept out
 
 `.url` files go, always. They are browser bookmarks and the one in these
@@ -261,7 +285,7 @@ writable layer.
 python selftest.py
 ```
 
-157 checks, none of which touch the network or need an archiver. The store is
+163 checks, none of which touch the network or need an archiver. The store is
 faked at the urlopen boundary, the share page at the session boundary, and the
 download at the same, so the parsing is tested — including the case where the
 page gives no link, which has to be a clear error rather than a silently wrong

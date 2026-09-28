@@ -335,7 +335,8 @@ def scrapling_problem() -> str | None:
 
 
 def resolve_share(url_or_hash: str, headed: bool = False,
-                  timeout: int = 90_000) -> Share:
+                  timeout: int = 90_000, tries: int = 3,
+                  pause: float = 6.0) -> Share:
     """Scrape the share page for the link the download actually comes from.
 
     This is the step the API cannot do. `check-file` says a file exists, what
@@ -363,8 +364,23 @@ def resolve_share(url_or_hash: str, headed: bool = False,
         else url_or_hash
     from scrapling.fetchers import StealthySession
 
-    page = _open_share(StealthySession, page_url, headed, timeout)
-    return _share_from(page, page_url)
+    # Retried, because a challenge that does not clear is usually a transient
+    # thing -- a busy widget, a rate limit from the last one, a network wobble
+    # -- and not evidence that anything is wrong. Observed on a real run: the
+    # same share resolved cleanly on the retry having failed outright the
+    # first time, and without this it would have failed the whole entry.
+    last = ""
+    for attempt in range(1, max(1, tries) + 1):
+        try:
+            page = _open_share(StealthySession, page_url, headed, timeout)
+            return _share_from(page, page_url)
+        except ShareUnavailable as exc:
+            last = str(exc)
+            if attempt < tries:
+                say(f"   link did not come out (attempt {attempt}/{tries}), "
+                    f"waiting {pause:.0f}s")
+                time.sleep(pause)
+    raise ShareUnavailable(last)
 
 
 def _open_share(session_cls, page_url: str, headed: bool, timeout: int):
@@ -874,6 +890,40 @@ def _is_inside_target(name: str) -> bool:
         return False
     parts = [p for p in name.replace("\\", "/").split("/") if p not in ("", ".")]
     return bool(parts) and ".." not in parts
+
+
+def retag_inner_folder(root: Path, wanted: str) -> tuple[str, str] | None:
+    """Rename a lone top-level folder that still carries the UC branding.
+
+    Returns (old, new) or None. `wanted` is the stem the archive itself is
+    getting, so the folder inside and the archive around it end up agreeing.
+
+    Deliberately timid. Only one top-level directory is considered, and only
+    if stripping UC actually changes its name -- so a release that unpacks to
+    several folders, or whose single folder is the game's own (Data, bin,
+    Touhou Luna Nights with no branding on it), comes out untouched. Renaming
+    a folder the game did not name after its packer would be a surprise in a
+    different direction.
+    """
+    try:
+        children = [p for p in root.iterdir() if p.is_dir()]
+    except OSError:
+        return None
+    if len(children) != 1:
+        return None
+    folder = children[0]
+    cleaned = strip_uc(folder.name)
+    if cleaned == folder.name:
+        return None
+    target = root / wanted
+    if target.exists():
+        return None
+    try:
+        folder.replace(target)
+    except OSError as exc:
+        warn(f"could not rename {folder.name}: {exc}")
+        return None
+    return (folder.name, target.name)
 
 
 def add_files(root: Path, entries: list[str], dry_run: bool = False,
@@ -1407,6 +1457,24 @@ def main(argv: list[str] | None = None) -> int:
     screen_entries(unsafe, "archive")
     archiver.extract(download_path, unpack)
     say(f"   unpacked into {unpack}")
+
+    # -- name the folder inside ------------------------------------------
+    # These archives wrap the game in a folder named after whoever packed it:
+    # "Touhou Luna Nights - UC/". Renaming the archive was only half of it --
+    # unpacked, the release still carried somebody else's mark, and that is
+    # the name people see first.
+    #
+    # Done here, immediately after unpacking and before anything is added,
+    # because that is the only point where the game's own folder is alone.
+    # Later there is ~Common Redist beside it, a second top-level directory,
+    # and a check for "exactly one" would then decline to touch either.
+    #
+    # Narrow on purpose: one top-level directory, and only when stripping UC
+    # actually changes its name. A game whose own folder is called "Data" or
+    # "bin", or an archive that unpacks to several folders, is left alone.
+    retag = retag_inner_folder(unpack, out_stem)
+    if retag:
+        say(f"   folder inside: {retag[0]} -> {retag[1]}")
 
     # -- edit -----------------------------------------------------------
     # The patterns the profile chose, plus the standard sweep. A .url is a
