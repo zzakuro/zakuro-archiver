@@ -47,6 +47,11 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# Sits beside this file rather than inside it: the downloader is the part
+# most likely to be replaced, and keeping it separate means the pipeline above
+# reads as a pipeline and not as a networking tutorial.
+import parallel
+
 API = "https://vikingfile.com/api"
 FILE_URL = "https://vikingfile.com/f/{}"
 # The host writes sizes in decimal (3.14 MB) but the values are powers of 1024
@@ -78,6 +83,11 @@ RAR_LEVEL = {"store": "-m0", "fast": "-m1", "normal": "-m3", "high": "-m4", "max
 # --------------------------------------------------------------- small helpers
 def say(msg: str) -> None:
     print(msg, flush=True)
+
+
+# The downloader logs through this rather than importing it, which would be a
+# circle. Set once, here, where both names already exist.
+parallel.report = say
 
 
 def warn(msg: str) -> None:
@@ -469,108 +479,74 @@ def parse_page_size(text: str) -> int:
 
 # ------------------------------------------------------------------ download
 def download(url: str, dest: Path, expect: int = 0, timeout: int = 60,
-             referer: str = "") -> int:
+             referer: str = "", connections: int = 0, cancel=None,
+             progress=None) -> int:
     """Fetch `url` to `dest`, resuming a partial file if there is one.
+
+    As many connections as asked for where the host will serve ranges, and one
+    where it will not. The host throttles per connection -- which is why its
+    own page offers "4 parallel threads" -- so a single stream leaves most of
+    the link idle. That is the whole reason this is not just one GET.
+
+    The fallback is the point. Ranges are probed first and a host that
+    ignores them gets one connection and nothing changes for it, because four
+    threads each sent the whole file would produce an archive the right size
+    and full of holes. A chunk that comes back short also brings the whole
+    thing back to one connection.
 
     Returns the byte count on disk. Raises on a short read, because an archive
     that stops halfway is the one failure that wastes the most time: it only
     shows up when the extractor cannot read it, long after the download.
     """
+    connections = connections or _default_connections()
     dest.parent.mkdir(parents=True, exist_ok=True)
-    have = dest.stat().st_size if dest.is_file() else 0
-    headers = {"User-Agent": USER_AGENT}
-    if referer:
-        # The download endpoint is served by the same host as the share
-        # page and expects to be coming from it.
-        headers["Referer"] = referer
-    if have and expect and have < expect:
-        say(f"   resuming at {human(have)} of {human(expect)}")
-        headers["Range"] = f"bytes={have}-"
-    elif have:
-        # A partial file that is not shorter than the whole thing is no use.
-        have = 0
-        dest.unlink(missing_ok=True)
-    resume_from = have
 
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        resp = urllib.request.urlopen(req, timeout=timeout)
-    except urllib.error.HTTPError as exc:
-        if exc.code == 416 and have:
-            # The server refused the range, which means the file on disk is
-            # already at least as long as the one it has. Checked against
-            # what the page said rather than assumed, because a partial that
-            # overran is exactly the case worth catching.
-            if expect and have < expect * (1 - _SIZE_TOLERANCE):
-                raise SystemExit(
-                    f"the server says the file is complete but only "
-                    f"{human(have)} is here against {human(expect)} expected; "
-                    f"delete the partial and start again"
-                ) from exc
-            say("   the server says the file is already complete")
-            return have
-        raise SystemExit(f"download failed: HTTP {exc.code} {exc.reason}") from exc
-    except (urllib.error.URLError, OSError, TimeoutError) as exc:
-        raise SystemExit(f"download failed: {exc}") from exc
+    if connections > 1:
+        try:
+            ranged, total = parallel.probe(url, referer=referer,
+                                           timeout=min(timeout, 30))
+        except Exception:
+            ranged, total = False, 0
+        if ranged and total:
+            bar = progress or parallel.Progress(total=total)
+            if expect and abs(total - expect) > expect * _SIZE_TOLERANCE:
+                warn(f"the server says {human(total)} and the page said "
+                     f"{human(expect)}; going with the server")
+            try:
+                got = parallel.fetch_parallel(
+                    url, dest, total, connections=connections, timeout=timeout,
+                    referer=referer, cancel=cancel, progress=bar)
+            except parallel.RangeUnsupported as exc:
+                # It sent the whole file instead of the slice asked for. The
+                # offsets it wrote are meaningless, so start again on one.
+                warn(f"{exc}; falling back to a single connection")
+                dest.unlink(missing_ok=True)
+            except parallel.DownloadCancelled:
+                raise
+            except (OSError, urllib.error.URLError) as exc:
+                warn(f"parallel download failed ({exc}); falling back to one connection")
+                dest.unlink(missing_ok=True)
+            else:
+                return got
 
-    mode = "ab" if (resume_from and resp.status == 206) else "wb"
-    if mode == "wb":
-        # The server ignored the range and is sending the whole file, so the
-        # partial has to go or the two halves end up concatenated.
-        resume_from = have = 0
+    return _download_single(url, dest, expect=expect, timeout=timeout,
+                             referer=referer, cancel=cancel, progress=progress)
 
-    # What the finished file should weigh. The response's own Content-Length
-    # wins: it is a byte count, and for a 206 it is the remainder, so the
-    # already-downloaded part is added back. `expect` is only a fallback,
-    # because it comes off a page that rounds to three significant figures --
-    # "2.47 GB" is 2,652,142,305 and the file could be anything within about
-    # 5 MB of it. Comparing a download against a rounded number exactly is how
-    # a complete file gets reported as short.
-    declared = int(resp.headers.get("Content-Length") or 0)
-    if declared:
-        total = declared + resume_from
-        exact = True
-    else:
-        total = expect or 0
-        exact = False
 
-    shown = 0
-    started = time.time()
-    last = 0.0
-    try:
-        with dest.open(mode) as out:
-            while True:
-                chunk = resp.read(1024 * 1024)
-                if not chunk:
-                    break
-                out.write(chunk)
-                have += len(chunk)
-                now = time.time()
-                if now - last > 1.0:
-                    last = now
-                    rate = (have - resume_from) / max(now - started, 0.001)
-                    pct = f"{have * 100 / total:5.1f}%" if total else "  ?  "
-                    print(f"\r   {pct}  {human(have)}  {human(rate)}/s   ",
-                          end="", flush=True)
-                    shown = have
-    except (urllib.error.URLError, OSError, TimeoutError) as exc:
-        print()
-        raise SystemExit(f"download interrupted at {human(shown)}: {exc}") from exc
-    finally:
-        # A stand-in in the tests has no close(); a real response always does.
-        close = getattr(resp, "close", None)
-        if callable(close):
-            close()
-    print()
-    if total:
-        # Slack only where the total is a rounded figure rather than a count.
-        slack = 0 if exact else int(total * _SIZE_TOLERANCE)
-        if have + slack < total:
-            raise SystemExit(
-                f"download is short: got {human(have)} of {human(total)} "
-                f"(re-run to resume)"
-            )
-    return have
+def _download_single(url: str, dest: Path, expect: int = 0, timeout: int = 60,
+                     referer: str = "", cancel=None, progress=None) -> int:
+    """One connection, resuming, with the checks the old path had."""
+    return parallel.fetch_single(
+        url, dest, expect=expect, timeout=timeout, referer=referer,
+        cancel=cancel, progress=progress, size_tolerance=_SIZE_TOLERANCE)
+
+
+def _default_connections() -> int:
+    """How many connections to use, from the environment."""
+    raw = os.environ.get("UC_CONNECTIONS", "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return parallel.DEFAULT_CONNECTIONS
 
 
 # --------------------------------------------------------------- the archiver

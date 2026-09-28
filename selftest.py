@@ -1014,6 +1014,121 @@ def _inner_folder_checks(checks) -> None:
     _shutil.rmtree(root, ignore_errors=True)
 
 
+def _parallel_download_checks(checks) -> None:
+    """The parallel downloader, against a server that can be told to misbehave.
+
+    Served locally over real HTTP rather than faked at urlopen, because the
+    things that go wrong here are protocol-level: a server that answers 200 to
+    a Range request instead of 206, a chunk that comes back short, four
+    threads writing into one file. A stubbed urlopen cannot produce any of
+    those, and the fallback would then be assumed rather than tested.
+    """
+    import shutil as _shutil
+    from pathlib import Path as _Path
+
+    import parallel
+    from testserver import Server
+
+    # Not a pattern of one byte: a payload like that can be produced by a
+    # broken writer and look fine.
+    payload = bytes((i * 7 + 11) % 251 for i in range(300_000))
+
+    work = _Path(tempfile.mkdtemp(prefix="uc-par-"))
+    try:
+        # -- the host serves ranges ------------------------------------
+        srv = Server(payload, honour_ranges=True)
+        try:
+            dest = work / "four.bin"
+            got = uc.download(srv.url, dest, expect=len(payload),
+                              connections=4, timeout=10)
+            checks.check("parallel: four connections fetch the whole file",
+                         got == len(payload) and dest.read_bytes() == payload,
+                         f"{got} of {len(payload)}")
+            checks.check("parallel: it really used more than one connection",
+                         srv.hits > 2, f"{srv.hits} request(s)")
+        finally:
+            srv.close()
+
+        # -- and one that does not -------------------------------------
+        # The dangerous case. Every thread would be sent the whole file and
+        # each would write it at its own offset, giving an archive the right
+        # size and full of holes.
+        srv = Server(payload, honour_ranges=False)
+        try:
+            dest = work / "noreranges.bin"
+            got = uc.download(srv.url, dest, expect=len(payload),
+                              connections=4, timeout=10)
+            checks.check("parallel: a host that ignores ranges still gets a whole file",
+                         got == len(payload) and dest.read_bytes() == payload,
+                         f"{got} of {len(payload)}")
+            checks.check("parallel: and it is byte-for-byte right, not just the right size",
+                         dest.read_bytes() == payload)
+        finally:
+            srv.close()
+
+        # -- one connection is still one connection --------------------
+        srv = Server(payload, honour_ranges=True)
+        try:
+            dest = work / "one.bin"
+            got = uc.download(srv.url, dest, expect=len(payload),
+                              connections=1, timeout=10)
+            checks.check("download: one connection works and is exact",
+                         got == len(payload) and dest.read_bytes() == payload)
+        finally:
+            srv.close()
+
+        # -- resume ----------------------------------------------------
+        srv = Server(payload, honour_ranges=True)
+        try:
+            dest = work / "resume.bin"
+            dest.write_bytes(payload[:100_000])
+            got = uc.download(srv.url, dest, expect=len(payload),
+                              connections=4, timeout=10)
+            checks.check("parallel: a partial file is continued, not restarted",
+                         got == len(payload) and dest.read_bytes() == payload,
+                         f"{got} of {len(payload)}")
+        finally:
+            srv.close()
+
+        # -- cancellation ------------------------------------------------
+        srv = Server(payload, honour_ranges=True)
+        try:
+            dest = work / "cancel.bin"
+            state = {"n": 0}
+
+            def cancel():
+                state["n"] += 1
+                return state["n"] > 2
+
+            try:
+                uc.download(srv.url, dest, expect=len(payload),
+                            connections=4, timeout=10, cancel=cancel)
+                checks.check("parallel: cancelling stops it", False, "it finished anyway")
+            except parallel.DownloadCancelled:
+                checks.check("parallel: cancelling stops it", True)
+            checks.check("parallel: and the partial is left, not deleted",
+                         dest.is_file(), "the partial was thrown away")
+        finally:
+            srv.close()
+
+        # -- splitting ---------------------------------------------------
+        spans = parallel.split_span(0, 99, 4)
+        checks.check("split: four spans cover the range exactly",
+                     sum(s.length for s in spans) == 100
+                     and spans[0].start == 0 and spans[-1].end == 99, str(spans))
+        ragged = parallel.split_span(0, 9, 4)
+        checks.check("split: a remainder is spread, not dumped on the last",
+                     sum(s.length for s in ragged) == 10
+                     and max(s.length for s in ragged) - min(s.length for s in ragged) <= 1,
+                     str(ragged))
+        checks.check("split: an empty range gives no spans",
+                     parallel.split_span(5, 4, 4) == [])
+        checks.check("split: one connection means one span",
+                     len(parallel.split_span(0, 999, 1)) == 1)
+    finally:
+        _shutil.rmtree(work, ignore_errors=True)
+
+
 def main() -> int:
     checks = Checks()
     run(checks)
@@ -1028,6 +1143,7 @@ def main() -> int:
     _standard_add_checks(checks)
     _naming_and_sweep_checks(checks)
     _inner_folder_checks(checks)
+    _parallel_download_checks(checks)
     total = checks.passed + checks.failed
     print(f"uc-archiver selftest: {checks.passed} passed, {checks.failed} failed")
     return 1 if checks.failed else 0
