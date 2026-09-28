@@ -582,6 +582,47 @@ class Archiver:
                             if ln.startswith("Path = ")]
         return []
 
+    def unpacked_size(self, archive: Path) -> int:
+        """How big this archive gets once it is unpacked, in bytes.
+
+        Asked of the archiver rather than worked out, because the only number
+        anyone has before unpacking is the compressed one, and the two are not
+        related by anything predictable. A real entry compressed 23.5:1 -- a
+        3.1 MB .7z holding 73.7 MB -- while another sat near 1.3:1. A free
+        space check against the download size would have cleared the first and
+        then run out of disk part way through unpacking it.
+
+        Returns 0 when the archiver will not say, which is the caller being
+        told "unknown" rather than "fine".
+        """
+        for exe in [p for p in (self.primary, self.secondary) if p]:
+            if "rar" in exe.name.lower():
+                # `vt` is the technical listing. It ends with a totals line
+                # that is "<bytes> <count> <count> files, <n> folders" --
+                # matching on that rather than on any two-number line, because
+                # every file in the listing is also two numbers and a size.
+                proc = self._run(exe, ["vt", str(archive)])
+                if proc.returncode != 0:
+                    continue
+                found = re.search(r"^\s*(\d+)\s+\d+\s+\d+ files", proc.stdout,
+                                   re.MULTILINE)
+                if found:
+                    return int(found.group(1))
+            else:
+                proc = self._run(exe, ["l", "-slt", str(archive)])
+                if proc.returncode != 0:
+                    continue
+                # -slt gives one "Size = n" per entry and no total of its own,
+                # so it has to be added up. Taking the largest instead would
+                # have reported a single 70 MB file as the size of a 73 MB
+                # archive, which is the kind of wrong that still looks
+                # plausible.
+                sizes = [int(m) for m in
+                         re.findall(r"^Size = (\d+)\s*$", proc.stdout, re.MULTILINE)]
+                if sizes:
+                    return sum(sizes)
+        return 0
+
     def pack(self, source: Path, archive: Path, level: str = "normal",
              test: bool = True) -> None:
         archive.parent.mkdir(parents=True, exist_ok=True)
@@ -1098,6 +1139,24 @@ def main(argv: list[str] | None = None) -> int:
     if unpack.exists():
         shutil.rmtree(unpack)
     unpack.mkdir(parents=True)
+    # Now the archive can be asked what it turns into, which nothing could have
+    # told us from the catalogue. Checked before unpacking rather than after,
+    # because running out of disk halfway leaves a partial folder that the next
+    # step would then repack as if it were the whole game.
+    expand = archiver.unpacked_size(download_path)
+    if expand:
+        room = free_bytes(work_base)
+        # The download, the unpacked tree and the finished archive all have to
+        # fit at once, plus slack: the repack is written to the same volume and
+        # a .rar of a .7z is not reliably smaller.
+        want = got + expand + int(expand * 0.05)
+        say(f"   expands to {human(expand)}")
+        if room and room < want:
+            raise SystemExit(
+                f"not enough room to unpack: {human(want)} needed in {work_base} "
+                f"for the download, the unpacked files and the finished archive, "
+                f"{human(room)} free. Point --work-dir at a bigger disk."
+            )
     unsafe = [n for n in archiver.list_names(download_path) if is_unsafe_entry(n)]
     screen_entries(unsafe, "archive")
     archiver.extract(download_path, unpack)

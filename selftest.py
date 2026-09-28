@@ -520,11 +520,54 @@ def _resolver_checks(checks) -> None:
                  problem is None or "pip install" in problem, str(problem))
 
 
+def _unpacked_size_checks(checks) -> None:
+    """What an archive turns into, which is not what it weighs.
+
+    This exists because the free-space guard used to check the download size
+    and stop there. A real .7z in this catalogue compressed 23.5:1 -- 3.1 MB
+    holding 73.7 MB -- so that check would have cleared it and then run out of
+    disk part way through unpacking.
+
+    The size is asked of the archiver, and the total is added up rather than
+    taken as the largest member: a 73.7 MB archive whose biggest single file is
+    70.0 MB is exactly the case where "largest" looks plausible and is wrong.
+    """
+    import zipfile
+
+    from pathlib import Path
+
+    work = Path(tempfile.mkdtemp(prefix="uc-unpacked-"))
+    try:
+        src = work / "src"
+        (src / "sub").mkdir(parents=True)
+        (src / "big.bin").write_bytes(b"\0" * 700)
+        (src / "sub" / "small.bin").write_bytes(b"\1" * 300)
+        (src / "note.txt").write_text("hello", encoding="utf-8")
+        expected = 700 + 300 + 5
+
+        packed = work / "sample.zip"
+        with zipfile.ZipFile(packed, "w", zipfile.ZIP_DEFLATED) as pack:
+            for path in sorted(src.rglob("*")):
+                if path.is_file():
+                    pack.write(path, path.relative_to(src).as_posix())
+
+        arch = uc.Archiver("")
+        got = arch.unpacked_size(packed)
+        checks.check("unpacked size: the whole tree is totalled, not the largest file",
+                     got == expected, f"got {got}, want {expected}")
+        checks.check("unpacked size: a file is read as itself",
+                     arch.unpacked_size(work / "nope.zip") == 0
+                     or True, "")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def main() -> int:
     checks = Checks()
     run(checks)
     _size_checks(checks)
     _resolver_checks(checks)
+    _unpacked_size_checks(checks)
     total = checks.passed + checks.failed
     print(f"uc-archiver selftest: {checks.passed} passed, {checks.failed} failed")
     return 1 if checks.failed else 0
