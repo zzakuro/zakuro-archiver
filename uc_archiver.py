@@ -959,6 +959,14 @@ def profile_path(catalogue: Catalogue, base: Path) -> Path:
 # is why these are added as `required=False`: a Desktop that has moved should
 # cost a warning, not stop every run. An explicit --add still fails loudly,
 # because that one was asked for by name.
+# Always stripped from a release. A .url is a browser bookmark, and the one
+# in these archives points at whoever packed it -- union-crax.xyz and the
+# like. It is not part of the game, it is an advert for them, and it has no
+# business shipping in a release that carries somebody else's name on it.
+# Kept separate from the profile's `remove` for the same reason `default_add`
+# is: a pattern the user chose is theirs, this is not.
+DEFAULT_REMOVE = ["*.url"]
+
 DEFAULT_ADD = [
     r"C:\Users\Mfree\OneDrive\Desktop\~Common Redist",
     r"C:\Users\Mfree\OneDrive\Documents\zakuro-tool\ReadME.txt",
@@ -973,6 +981,7 @@ class Profile:
     # is optional: these paths are absolute and only true on one machine, so
     # one that has moved is a warning rather than a failure.
     default_add: list[str] = field(default_factory=lambda: list(DEFAULT_ADD))
+    default_remove: list[str] = field(default_factory=lambda: list(DEFAULT_REMOVE))
     level: str = "normal"
     archiver: str = ""
     output_dir: str = ""
@@ -984,6 +993,7 @@ class Profile:
             "remove": list(self.remove),
             "add": list(self.add),
             "default_add": list(self.default_add),
+            "default_remove": list(self.default_remove),
             "level": self.level,
             "archiver": self.archiver,
             "output_dir": self.output_dir,
@@ -998,6 +1008,8 @@ class Profile:
             add=[str(x) for x in (data.get("add") or [])],
             default_add=([str(x) for x in data["default_add"]]
                          if "default_add" in data else list(DEFAULT_ADD)),
+            default_remove=([str(x) for x in data["default_remove"]]
+                            if "default_remove" in data else list(DEFAULT_REMOVE)),
             level=str(data.get("level") or "normal"),
             archiver=str(data.get("archiver") or ""),
             output_dir=str(data.get("output_dir") or ""),
@@ -1020,9 +1032,29 @@ def save_profile(path: Path, profile: Profile) -> None:
 
 
 # ----------------------------------------------------------------------- name
+TAG = "[Zakuro]"
+
+# The catalogue these come from brands its archives with a trailing "UC" --
+# "Hollow Knight - UC.7z". That is somebody else's mark on a file that is
+# about to carry ours, so it comes off and the Zakuro tag goes on in its
+# place. Matched on a word boundary at the end of the name, so a game whose
+# own title ends in those letters is left alone.
+_UC_TAIL = re.compile(r"[\s\-_–—]*\buc\b[\s\-_–—]*$", re.IGNORECASE)
+
+
+def strip_uc(name: str) -> str:
+    """`'Hollow Knight - UC' -> 'Hollow Knight'`. Falls back to the input."""
+    return _UC_TAIL.sub("", name).strip() or name
+
+
 def zakuro_name(stem: str, ext: str) -> str:
-    """`Game [Zakuro].rar`, and not `Game [Zakuro] [Zakuro].rar` on a re-run."""
-    clean = re.sub(r"\s*\[Zakuro\]\s*", " ", stem, flags=re.IGNORECASE).strip()
+    """`Game [Zakuro].rar`, from any of the shapes a source name arrives in.
+
+    Takes off the UC branding, takes off a tag that is already there so a
+    re-run does not produce `Game [Zakuro] [Zakuro].rar`, and puts ours on.
+    """
+    clean = re.sub(r"\s*\[Zakuro\]\s*", " ", stem, flags=re.IGNORECASE)
+    clean = strip_uc(clean).strip()
     return f"{clean} {TAG}{ext}"
 
 
@@ -1125,6 +1157,8 @@ def resolve_settings(args, cat: Catalogue, base: Path) -> tuple[Profile, Path]:
     # A profile saved before this existed carries the standard set implicitly.
     if profile.default_add is DEFAULT_ADD:
         profile.default_add = list(DEFAULT_ADD)
+    if profile.default_remove is DEFAULT_REMOVE:
+        profile.default_remove = list(DEFAULT_REMOVE)
     if args.remove is not None:
         profile.remove = list(args.remove)
     if args.add is not None:
@@ -1248,16 +1282,20 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     # -- is there already one of these? ---------------------------------
-    # Asked here, before anything is fetched, because the answer does not
-    # change between now and the repack. Checking it at the end instead means
-    # downloading an entry -- these run to 155 GB -- only to throw the result
-    # away and leave the download on disk. The same question is asked again
-    # just before the move, in case something else wrote there meanwhile.
-    archive = out_dir / zakuro_name(stem, ext)
-    if archive.exists() and not args.force:
+    # Asked on the name the host uses, which is only known after the page has
+    # been resolved -- so this sits below that rather than here. It still
+    # happens before the download, which is the part that matters: these run
+    # to 155 GB, and finding out at the end means fetching the whole thing to
+    # throw it away. Asked again just before the move, in case something else
+    # wrote there meanwhile.
+    #
+    # The early check on the catalogue name stays as a cheap first guard, since
+    # a re-run usually produces the same name as last time.
+    provisional = out_dir / zakuro_name(stem, ext)
+    if provisional.exists() and not args.force:
         raise SystemExit(
-            f"{archive.name} is already there. Pass --force to replace it, or "
-            f"--output-dir somewhere else to keep both."
+            f"{provisional.name} is already there. Pass --force to replace it, "
+            f"or --output-dir somewhere else to keep both."
         )
 
     # -- wait for it ----------------------------------------------------
@@ -1293,6 +1331,25 @@ def main(argv: list[str] | None = None) -> int:
         remote_name = share.name
     if share.size:
         remote_size = share.size
+
+    # -- name it ---------------------------------------------------------
+    # The host's own filename, with the UC branding off, rather than the
+    # catalogue's title. The host calls it "Hollow Knight - UC.7z" and the
+    # catalogue calls it "Hollow Knight (V1.5.12620)"; the first describes
+    # the archive and the second carries a build id that means nothing to
+    # whoever unpacks it. "Hollow Knight [Zakuro].rar" comes out of the first.
+    # Only the last path component is ever used, so a host that answers with
+    # a full path cannot steer the name out of the output directory.
+    host_stem = Path(str(remote_name).replace("\\", "/")).stem
+    host_stem = re.sub(r'[<>:"/\\|?*]+', "_", host_stem).strip()
+    out_stem = host_stem or strip_uc(stem)
+    archive = out_dir / zakuro_name(out_stem, ext)
+    say(f"   {archive.name}")
+    if archive.exists() and not args.force:
+        raise SystemExit(
+            f"{archive.name} is already there. Pass --force to replace it, or "
+            f"--output-dir somewhere else to keep both."
+        )
 
     # -- download -------------------------------------------------------
     step("downloading")
@@ -1352,9 +1409,18 @@ def main(argv: list[str] | None = None) -> int:
     say(f"   unpacked into {unpack}")
 
     # -- edit -----------------------------------------------------------
-    if profile.remove:
+    # The patterns the profile chose, plus the standard sweep. A .url is a
+    # browser bookmark -- in these archives it points at whoever packed it,
+    # union-crax.xyz and the like -- and it is not part of the game.
+    strip = list(profile.remove)
+    seen = {_norm(p) for p in strip}
+    for pattern in profile.default_remove:
+        if _norm(pattern) not in seen:
+            strip.append(pattern)
+            seen.add(_norm(pattern))
+    if strip:
         step("removing")
-        for rel in remove_matches(unpack, profile.remove):
+        for rel in remove_matches(unpack, strip):
             say(f"   - {rel}")
 
     # --add is what the command line or the profile asked for; the standard

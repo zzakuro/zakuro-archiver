@@ -42,6 +42,39 @@ rather than a regex on purpose: the host has already moved domain once
 (`vikingfile.com` → `vik1ngfile.site`) and the download path has changed shape
 before.
 
+## The output name
+
+The host brands its archives with a trailing `UC` — `Hollow Knight - UC.7z`.
+That is somebody else's mark on a file that is about to carry ours, so it comes
+off and the tag goes on in its place:
+
+| The host calls it | You get |
+| --- | --- |
+| `Hollow Knight - UC.7z` | `Hollow Knight [Zakuro].rar` |
+| `Touhou Reiiden ... - UC.7z` | `Touhou Reiiden ... [Zakuro].rar` |
+| `Hollow Knight [Zakuro].rar` | `Hollow Knight [Zakuro].rar` (not doubled) |
+| `Lacuna.7z` | `Lacuna [Zakuro].rar` — a title ending in those letters is left alone |
+
+The host's own filename is used, not the catalogue's title, because the host
+describes the archive and the catalogue carries a build id:
+`Hollow Knight (V1.5.12620)` in the catalogue, `Hollow Knight - UC.7z` on the
+host. Only the last path component is ever read, so a host answering with a
+full path cannot steer the name out of the output directory.
+
+## What gets swept out
+
+`.url` files go, always. They are browser bookmarks and the one in these
+archives points at whoever packed it — `union-crax.xyz`:
+
+```
+- UnionCrax.url
+```
+
+It is not part of the game, it is an advert for them, and it has no business
+shipping in a release carrying somebody else's name on it. It is a
+`default_remove` like the standard additions are, so a profile can put it back
+with `{"default_remove": []}`.
+
 ## What --remove and --add match
 
 **`--remove` takes every match, at any depth.** One name, all of them:
@@ -228,7 +261,7 @@ writable layer.
 python selftest.py
 ```
 
-144 checks, none of which touch the network or need an archiver. The store is
+157 checks, none of which touch the network or need an archiver. The store is
 faked at the urlopen boundary, the share page at the session boundary, and the
 download at the same, so the parsing is tested — including the case where the
 page gives no link, which has to be a clear error rather than a silently wrong

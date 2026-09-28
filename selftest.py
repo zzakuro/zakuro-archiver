@@ -896,6 +896,65 @@ def _standard_add_checks(checks) -> None:
         _shutil.rmtree(work, ignore_errors=True)
 
 
+def _naming_and_sweep_checks(checks) -> None:
+    """The output name, and the .url sweep.
+
+    The host brands its archives with a trailing "UC" -- "Hollow Knight - UC.7z"
+    -- and that mark has to come off before ours goes on. It is also matched on
+    a word boundary, so a game whose own title happens to end in those letters
+    is not mangled.
+    """
+    import shutil as _shutil
+    from pathlib import Path as _Path
+
+    name = uc.zakuro_name
+    checks.check("name: the UC branding comes off and the tag goes on",
+                 name("Hollow Knight - UC", ".rar") == "Hollow Knight [Zakuro].rar",
+                 name("Hollow Knight - UC", ".rar"))
+    checks.check("name: a long UC name loses only the branding",
+                 name("Touhou Reiiden The Highly Responsive to Prayers - UC", ".rar")
+                 == "Touhou Reiiden The Highly Responsive to Prayers [Zakuro].rar")
+    checks.check("name: a name that already has the tag does not get a second",
+                 name("Hollow Knight [Zakuro]", ".rar") == "Hollow Knight [Zakuro].rar",
+                 name("Hollow Knight [Zakuro]", ".rar"))
+    checks.check("name: UC and the tag together collapse to one tag",
+                 name("Hollow Knight - UC [Zakuro]", ".rar")
+                 == "Hollow Knight [Zakuro].rar")
+    checks.check("name: a title ending in those letters is left alone",
+                 name("Lacuna", ".rar") == "Lacuna [Zakuro].rar"
+                 and uc.strip_uc("Lacuna") == "Lacuna", uc.strip_uc("Lacuna"))
+    checks.check("name: a name that is only UC does not vanish",
+                 bool(uc.strip_uc("UC").strip()), repr(uc.strip_uc("UC")))
+    checks.check("name: a catalogue title is not disturbed",
+                 name("Hollow Knight (V1.5.12620)", ".rar")
+                 == "Hollow Knight (V1.5.12620) [Zakuro].rar")
+
+    # The .url sweep, and that a profile can turn it off.
+    checks.check("sweep: .url is in the standard removals",
+                 any(p.endswith(".url") for p in uc.DEFAULT_REMOVE), str(uc.DEFAULT_REMOVE))
+    checks.check("sweep: a fresh profile carries it",
+                 any(p.endswith(".url") for p in uc.Profile().default_remove))
+    checks.check("sweep: an old profile without the key still gets it",
+                 any(p.endswith(".url") for p in
+                     uc.Profile.from_dict({"remove": []}).default_remove))
+    checks.check("sweep: a profile that sets its own is left alone",
+                 uc.Profile.from_dict({"default_remove": []}).default_remove == [])
+
+    work = _Path(tempfile.mkdtemp(prefix="uc-url-"))
+    try:
+        (work / "UnionCrax.url").write_text(
+            "[InternetShortcut]\nURL=https://union-crax.xyz/\n", encoding="utf-8")
+        (work / "game.exe").write_text("x", encoding="utf-8")
+        (work / "readme.txt").write_text("keep me", encoding="utf-8")
+        gone = uc.remove_matches(work, list(uc.DEFAULT_REMOVE))
+        left = sorted(p.name for p in work.rglob("*") if p.is_file())
+        checks.check("sweep: the UnionCrax bookmark is gone", left == ["game.exe", "readme.txt"],
+                     str(left))
+        checks.check("sweep: and it says which file it took", "UnionCrax.url" in gone, str(gone))
+    finally:
+        _shutil.rmtree(work, ignore_errors=True)
+
+
 def main() -> int:
     checks = Checks()
     run(checks)
@@ -908,6 +967,7 @@ def main() -> int:
     _download_totals_checks(checks)
     _edit_checks(checks)
     _standard_add_checks(checks)
+    _naming_and_sweep_checks(checks)
     total = checks.passed + checks.failed
     print(f"uc-archiver selftest: {checks.passed} passed, {checks.failed} failed")
     return 1 if checks.failed else 0
