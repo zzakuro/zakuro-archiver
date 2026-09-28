@@ -55,6 +55,12 @@ FILE_URL = "https://vikingfile.com/f/{}"
 _UNIT_SCALE = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3,
                "TB": 1024 ** 4, "KIB": 1024, "MIB": 1024 ** 2,
                "GIB": 1024 ** 3, "TIB": 1024 ** 4}
+# How far a size read off a share page may be off, as a fraction. Three
+# significant figures of a gigabyte is about 0.2% of it, so half a percent
+# covers the rounding with room to spare -- and is only ever applied to a
+# figure that came from a page. A Content-Length is exact and is not given
+# this.
+_SIZE_TOLERANCE = 0.005
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"
@@ -90,12 +96,20 @@ def human(size: float) -> str:
     return f"{size:.1f} TB"
 
 
-def free_bytes(path: Path) -> int:
+def free_bytes(path: Path) -> int | None:
+    """Free space on the volume holding `path`, or None if it cannot be read.
+
+    None rather than 0 on purpose. A caller that treats 0 as "no room" would
+    refuse every run on a volume it cannot measure, and one that treats 0 as
+    "unknown" is indistinguishable from a real zero -- which is how a check
+    that could not run turns into a check that silently passed and a disk that
+    fills up anyway.
+    """
     try:
         path.mkdir(parents=True, exist_ok=True)
         return shutil.disk_usage(path).free
     except OSError:
-        return 0
+        return None
 
 
 # ------------------------------------------------------------------- catalogue
@@ -349,58 +363,92 @@ def resolve_share(url_or_hash: str, headed: bool = False,
         else url_or_hash
     from scrapling.fetchers import StealthySession
 
-    # A fresh session each time. Holding one open across many shares is
-    # faster, but the host issues a challenge per share and a stale clearance
-    # is a confusing failure much later on.
-    #
-    # scrapling logs "No Cloudflare challenge found" at ERROR when a page needs
-    # no challenge -- which happens once a clearance is held, and is the
-    # normal case on a second run. Left alone it reads like this tool failing,
-    # so its logger is lifted out of the way for the duration.
+    page = _open_share(StealthySession, page_url, headed, timeout)
+    return _share_from(page, page_url)
+
+
+def _open_share(session_cls, page_url: str, headed: bool, timeout: int):
+    """Load the page in a browser and return the parsed document.
+
+    Kept separate from the parsing so the logger handling cannot wrap it: a
+    `return` inside a `finally` swallows whatever exception was in flight, and
+    if the fetch fails there is no page to read, so the handler would fail
+    again on an unbound name and hide the real error behind a NameError.
+    """
     import logging
+
+    # scrapling logs "No Cloudflare challenge found" at ERROR when a page needs
+    # no challenge -- which happens once a clearance is held, and is the normal
+    # case on a second run. Left alone it reads like this tool failing.
     noisy = logging.getLogger("scrapling")
     previous = noisy.level
     noisy.setLevel(logging.CRITICAL)
     try:
-        with StealthySession(headless=not headed, solve_cloudflare=True,
-                             network_idle=True) as session:
-            page = session.fetch(page_url, timeout=timeout)
+        # A fresh session each time. Holding one open across many shares is
+        # faster, but the host issues a challenge per share and a stale
+        # clearance is a confusing failure much later on.
+        with session_cls(headless=not headed, solve_cloudflare=True,
+                         network_idle=True) as session:
+            return session.fetch(page_url, timeout=timeout)
     finally:
         noisy.setLevel(previous)
 
-        def text(selector: str) -> str:
-            try:
-                value = page.css(selector).get()
-            except Exception:
-                return ""
-            return (value or "").strip() if isinstance(value, str) else ""
 
-        name = text("#filename::text")
-        size_text = text("#size::text")
-        href = text("#download-link::attr(href)")
-        if not name:
-            # The ids have moved before. The title carries the same filename.
-            name = re.sub(r"\s*[-|]\s*(ViKiNG|UC|vikingfile).*$", "",
-                          text("title::text"), flags=re.I).strip()
-        if not size_text:
-            size_text = text("#file-information p::text")
-        if not href:
-            raise ShareUnavailable(
-                "the page gave no download link. The Cloudflare challenge may "
-                "not have cleared, or the site changed shape -- try again, or "
-                "run with --headed to watch it happen."
-            )
-        if href.startswith("/"):
-            href = "https://vikingfile.com" + href
+def _share_from(page, page_url: str) -> Share:
+    """Read the name, the size and the link out of a loaded share page."""
 
-        size = 0
+    def text(selector: str) -> str:
         try:
-            size = int(float(re.sub(r"[^0-9.]", "", size_text) or 0) * _UNIT_SCALE.get(
-                (re.sub(r"[^A-Za-z]", "", size_text) or "B").upper(), 1))
-        except ValueError:
-            size = 0
-        return Share(page_url=page_url, name=name or "download.bin",
-                     size=size, download_url=href)
+            value = page.css(selector).get()
+        except Exception:
+            return ""
+        return (value or "").strip() if isinstance(value, str) else ""
+
+    name = text("#filename::text")
+    size_text = text("#size::text")
+    href = text("#download-link::attr(href)")
+    if not name:
+        # The ids have moved before. The title carries the same filename.
+        name = re.sub(r"\s*[-|]\s*(ViKiNG|UC|vikingfile).*$", "",
+                      text("title::text"), flags=re.I).strip()
+    if not size_text:
+        size_text = text("#file-information p::text")
+    if not href:
+        raise ShareUnavailable(
+            "the page gave no download link. The Cloudflare challenge may "
+            "not have cleared, or the site changed shape -- try again, or "
+            "run with --headed to watch it happen."
+        )
+    if href.startswith("/"):
+        href = "https://vikingfile.com" + href
+    return Share(
+        page_url=page_url,
+        name=name or "download.bin",
+        size=parse_page_size(size_text),
+        download_url=href,
+    )
+
+
+def parse_page_size(text: str) -> int:
+    """"2.47 GB" -> a byte count, or 0 when it cannot be read.
+
+    The host writes sizes with a binary scale behind a decimal label --
+    "3.14 MB" for 3292956 bytes is 3.1409 MiB -- so the table is keyed on
+    1024, not 1000.
+
+    The result is approximate by construction: three significant figures of a
+    gigabyte is about 5 MB of rounding, which is why nothing downstream
+    compares against it exactly.
+    """
+    digits = re.sub(r"[^0-9.]", "", text or "")
+    unit = (re.sub(r"[^A-Za-z]", "", text or "") or "B").upper()
+    scale = _UNIT_SCALE.get(unit)
+    if not digits or scale is None:
+        return 0
+    try:
+        return int(float(digits) * scale)
+    except ValueError:
+        return 0
 
 
 # ------------------------------------------------------------------ download
@@ -426,22 +474,50 @@ def download(url: str, dest: Path, expect: int = 0, timeout: int = 60,
         # A partial file that is not shorter than the whole thing is no use.
         have = 0
         dest.unlink(missing_ok=True)
+    resume_from = have
 
     req = urllib.request.Request(url, headers=headers)
     try:
         resp = urllib.request.urlopen(req, timeout=timeout)
     except urllib.error.HTTPError as exc:
         if exc.code == 416 and have:
+            # The server refused the range, which means the file on disk is
+            # already at least as long as the one it has. Checked against
+            # what the page said rather than assumed, because a partial that
+            # overran is exactly the case worth catching.
+            if expect and have < expect * (1 - _SIZE_TOLERANCE):
+                raise SystemExit(
+                    f"the server says the file is complete but only "
+                    f"{human(have)} is here against {human(expect)} expected; "
+                    f"delete the partial and start again"
+                ) from exc
             say("   the server says the file is already complete")
             return have
         raise SystemExit(f"download failed: HTTP {exc.code} {exc.reason}") from exc
     except (urllib.error.URLError, OSError, TimeoutError) as exc:
         raise SystemExit(f"download failed: {exc}") from exc
 
-    mode = "ab" if (have and resp.status == 206) else "wb"
+    mode = "ab" if (resume_from and resp.status == 206) else "wb"
     if mode == "wb":
-        have = 0
-    total = expect or (int(resp.headers.get("Content-Length") or 0) + have)
+        # The server ignored the range and is sending the whole file, so the
+        # partial has to go or the two halves end up concatenated.
+        resume_from = have = 0
+
+    # What the finished file should weigh. The response's own Content-Length
+    # wins: it is a byte count, and for a 206 it is the remainder, so the
+    # already-downloaded part is added back. `expect` is only a fallback,
+    # because it comes off a page that rounds to three significant figures --
+    # "2.47 GB" is 2,652,142,305 and the file could be anything within about
+    # 5 MB of it. Comparing a download against a rounded number exactly is how
+    # a complete file gets reported as short.
+    declared = int(resp.headers.get("Content-Length") or 0)
+    if declared:
+        total = declared + resume_from
+        exact = True
+    else:
+        total = expect or 0
+        exact = False
+
     shown = 0
     started = time.time()
     last = 0.0
@@ -456,7 +532,7 @@ def download(url: str, dest: Path, expect: int = 0, timeout: int = 60,
                 now = time.time()
                 if now - last > 1.0:
                     last = now
-                    rate = have / max(now - started, 0.001)
+                    rate = (have - resume_from) / max(now - started, 0.001)
                     pct = f"{have * 100 / total:5.1f}%" if total else "  ?  "
                     print(f"\r   {pct}  {human(have)}  {human(rate)}/s   ",
                           end="", flush=True)
@@ -470,11 +546,14 @@ def download(url: str, dest: Path, expect: int = 0, timeout: int = 60,
         if callable(close):
             close()
     print()
-    if total and have < total:
-        raise SystemExit(
-            f"download is short: got {human(have)} of {human(total)} "
-            f"(re-run to resume)"
-        )
+    if total:
+        # Slack only where the total is a rounded figure rather than a count.
+        slack = 0 if exact else int(total * _SIZE_TOLERANCE)
+        if have + slack < total:
+            raise SystemExit(
+                f"download is short: got {human(have)} of {human(total)} "
+                f"(re-run to resume)"
+            )
     return have
 
 
@@ -1137,7 +1216,10 @@ def main(argv: list[str] | None = None) -> int:
     need = remote_size or 0
     if need:
         have = free_bytes(work_base)
-        if have and have < need * 1.05:
+        if have is None:
+            warn(f"could not read the free space on {work_base}, so the room "
+                 f"check is being skipped")
+        elif have < need * 1.05:
             raise SystemExit(
                 f"not enough room: {human(need)} needed in {work_base}, "
                 f"{human(have)} free"
@@ -1166,7 +1248,10 @@ def main(argv: list[str] | None = None) -> int:
         # a .rar of a .7z is not reliably smaller.
         want = got + expand + int(expand * 0.05)
         say(f"   expands to {human(expand)}")
-        if room and room < want:
+        if room is None:
+            warn(f"could not read the free space on {work_base}, so the room "
+                 f"check is being skipped -- these need about {human(want)}")
+        elif room < want:
             raise SystemExit(
                 f"not enough room to unpack: {human(want)} needed in {work_base} "
                 f"for the download, the unpacked files and the finished archive, "

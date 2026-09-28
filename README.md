@@ -44,17 +44,32 @@ before.
 
 ## Do not trust the catalogue's sizes
 
-It is out by a lot, and consistently in one direction:
+It is out by a lot, and it is not a systematic relationship:
 
 ```
-Among Us                   catalogue  992 MB   host  593.1 MB
-AColony                     catalogue 2.47 GB   host  605.7 MB
-Age of Empires              catalogue 12.05 GB  host  9.2 GB
+Touhou Rei'iden      catalogue   8 MB     host   3.1 MB   contents  73.7 MB
+Among Us            catalogue  992 MB    host  593.1 MB
+AColony              catalogue 2.47 GB   host  605.7 MB
+Age of Empires       catalogue 12.05 GB  host   9.2 GB
 ```
 
-Every size check uses what the **page** says, falling back to the API, and
-never the catalogue. `human()` rounds, so a difference of a few bytes between
-the two sources is not worth a warning.
+The Touhou entry settles it: the catalogue claims 8 MB for a file holding
+73.7 MB. So the figure is neither the packed size nor the unpacked one, and it
+is wrong in both directions rather than consistently off by a ratio.
+
+Every size check therefore uses what the **page** says, falling back to the
+API, and never the catalogue. Two things follow from that:
+
+- **The page rounds to three significant figures**, so its figure is
+  approximate. Nothing compares against it exactly: a download is measured
+  against the server's own `Content-Length` where there is one, and against
+  the page with half a percent of slack where there is not. Comparing a
+  finished download to a rounded number exactly reports complete files as
+  short.
+- **The archive is asked what it expands to** before anything is unpacked,
+  because a 3.1 MB `.7z` in this catalogue held 73.7 MB, and the free-space
+  check has to allow for the download, the unpacked tree and the finished
+  archive all at once.
 
 ## Install
 
@@ -135,10 +150,21 @@ writable layer.
 python selftest.py
 ```
 
-90 checks, none of which touch the network or need an archiver. The store is
-faked at the urlopen boundary and the share page is faked at the session
-boundary, so the parsing is tested — including the case where the page gives no
-link, which has to be a clear error rather than a silently wrong download.
+114 checks, none of which touch the network or need an archiver. The store is
+faked at the urlopen boundary, the share page at the session boundary, and the
+download at the same, so the parsing is tested — including the case where the
+page gives no link, which has to be a clear error rather than a silently wrong
+download.
+
+Three of them exist because the bug they cover was invisible otherwise:
+
+- the resolver is compiled with `SyntaxWarning` promoted to an error, because
+  a `return` inside a `finally` runs perfectly well and only misbehaves once
+  something has already gone wrong;
+- the download checks assert that a complete file passes against an estimate
+  that rounds **up**, which is the case an exact comparison fails;
+- free space is checked for returning "unknown" rather than zero, since zero
+  read as "no room" to one caller and "could not tell" to another.
 
 ## What it will not do
 

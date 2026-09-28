@@ -562,12 +562,169 @@ def _unpacked_size_checks(checks) -> None:
         shutil.rmtree(work, ignore_errors=True)
 
 
+def _page_size_checks(checks) -> None:
+    """The size on a share page, and what it must refuse to guess at.
+
+    The host writes a binary scale behind a decimal label: "3.14 MB" is
+    3292956 bytes, which is 3.1409 MiB. So the table is 1024-based, and a
+    unit this table has never heard of has to come back as "no idea" rather
+    than as a number of bytes -- an unknown unit used to fall through to a
+    scale of 1, which turned "12 parsecs" into an expectation of 12 bytes.
+    """
+    parse = uc.parse_page_size
+    checks.check("page size: 3.14 MB is the real 3292956, to the rounding",
+                 abs(parse("3.14 MB") - 3292956) < 1024, str(parse("3.14 MB")))
+    checks.check("page size: a GB entry is read in binary",
+                 abs(parse("2.47 GB") - int(2.47 * 1024 ** 3)) < 1024,
+                 str(parse("2.47 GB")))
+    checks.check("page size: TiB is understood",
+                 parse("1.5 TiB") == int(1.5 * 1024 ** 4), str(parse("1.5 TiB")))
+    checks.check("page size: stray whitespace is tolerated",
+                 parse("  4.7  MB  ") == parse("4.7 MB"))
+    for junk in ("", "?", "12 parsecs", "n/a", "MB"):
+        checks.check(f"page size: {junk!r} is refused, not guessed",
+                     parse(junk) == 0, str(parse(junk)))
+    checks.check("page size: zero is zero", parse("0 B") == 0)
+
+
+def _no_return_in_finally_checks(checks) -> None:
+    """The resolver must not return from inside a finally.
+
+    It did once, when the scrapling logger handling was wrapped around the
+    whole function body. A return in a finally discards whatever exception
+    was in flight, and if the fetch fails there is no page to read, so the
+    handler fails again on an unbound name and the NameError hides the real
+    error. Checked by compiling with the warning promoted to an error, which
+    is the only way to catch it -- it runs perfectly well otherwise.
+    """
+    import warnings
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        src = (HERE / "uc_archiver.py").read_text(encoding="utf-8")
+        compile(src, "uc_archiver.py", "exec")
+    bad = [w for w in caught if "finally" in str(w.message)]
+    checks.check("resolve: nothing returns from inside a finally", not bad,
+                 str([str(w.message) for w in bad]))
+
+
+def _free_space_checks(checks) -> None:
+    """"Cannot tell" must not look like "plenty of room".
+
+    free_bytes returned 0 when it could not read the volume, and every caller
+    tested it as `if have and have < want`, so a check that could not run was
+    indistinguishable from one that passed -- and the run then filled the disk
+    it had been asked to check. None now means unknown, and the caller says so.
+    """
+    import shutil as _shutil
+    from pathlib import Path as _Path
+
+    work = _Path(tempfile.mkdtemp(prefix="uc-free-"))
+    try:
+        real = uc.free_bytes(work)
+        checks.check("free space: a real folder reports a real number",
+                     isinstance(real, int) and real > 0, repr(real))
+        checks.check("free space: unreadable is None, not zero",
+                     uc.free_bytes(work / "x" / "y") is None
+                     or isinstance(uc.free_bytes(work), int),
+                     "expected None or an int, never a silent 0")
+        # A path that cannot exist at all: the mkdir inside will raise.
+        blocked = work / "file-not-a-dir"
+        blocked.write_text("x", encoding="utf-8")
+        checks.check("free space: a path that cannot be made reports unknown",
+                     uc.free_bytes(blocked / "under") is None,
+                     repr(uc.free_bytes(blocked / "under")))
+    finally:
+        _shutil.rmtree(work, ignore_errors=True)
+
+
+def _download_totals_checks(checks) -> None:
+    """A complete download must not be reported as short.
+
+    The expected size comes off a page that rounds to three significant
+    figures, so it can sit above the real byte count -- "2.47 GB" is
+    2,652,142,305 and the file could be 5 MB smaller. Comparing the finished
+    download against that exactly would fail every large entry, and the only
+    way to find out would be to try one.
+
+    The server's own Content-Length is the authority where there is one, and
+    the rounded figure is only a fallback, given half a percent of slack.
+    """
+    import io as _io
+
+    real = 3292956          # what the Touhou entry actually served
+    page = 3292528          # what "3.14 MB" parses to -- 428 bytes under
+
+    class Resp:
+        def __init__(self, body, declared, status=200):
+            self._body, self.status = body, status
+            self.headers = {"Content-Length": str(declared)}
+
+        def read(self, n):
+            data, self._body = self._body[:n], self._body[n:]
+            return data
+
+        def close(self):
+            pass
+
+    def fetch_with(body, declared, status=200, expect=page):
+        work = Path(tempfile.mkdtemp(prefix="uc-dl-"))
+        try:
+            import unittest.mock as _mock
+            with _mock.patch.object(uc.urllib.request, "urlopen",
+                                   lambda *_a, **_k: Resp(body, declared, status)):
+                return uc.download("https://x/y", work / "f.bin", expect=expect)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    checks.check("download: a full file against a slightly high estimate passes",
+                 fetch_with(b"z" * real, real, expect=page) == real)
+    # The case that was actually broken: the page rounds *up*, so the estimate
+    # is larger than the file. The old check compared the two exactly and
+    # called a complete download short.
+    high = real + 428
+    checks.check("download: a full file against a slightly HIGH estimate passes",
+                 fetch_with(b"z" * real, real, expect=high) == real)
+    checks.check("download: and with no Content-Length either",
+                 fetch_with(b"z" * real, 0, expect=high) == real)
+    # Proof the old comparison would have failed both of those:
+    checks.check("download: the old exact comparison really would have failed",
+                 real < high, "the premise does not hold")
+    checks.check("download: a genuinely short file is still caught",
+                 _raises(lambda: fetch_with(b"z" * 1000, 5000, expect=5000)),
+                 "a 1000-byte download of an expected 5000 was accepted")
+    # No Content-Length at all: the rounded figure is all there is, and it is
+    # 428 bytes high. That must not read as short.
+    checks.check("download: with no Content-Length the rounded figure gets slack",
+                 fetch_with(b"z" * real, 0, expect=page) == real)
+    checks.check("download: the tolerance is a fraction, not a byte or two",
+                 0 < uc._SIZE_TOLERANCE <= 0.01, str(uc._SIZE_TOLERANCE))
+    # And it must not be so loose that a real shortfall slips through.
+    checks.check("download: slack does not hide a real 5% shortfall",
+                 _raises(lambda: fetch_with(b"z" * int(real * 0.95), 0,
+                                            expect=page)))
+
+
+def _raises(fn) -> bool:
+    try:
+        fn()
+    except SystemExit:
+        return True
+    except Exception:
+        return True
+    return False
+
+
 def main() -> int:
     checks = Checks()
     run(checks)
     _size_checks(checks)
     _resolver_checks(checks)
     _unpacked_size_checks(checks)
+    _page_size_checks(checks)
+    _no_return_in_finally_checks(checks)
+    _free_space_checks(checks)
+    _download_totals_checks(checks)
     total = checks.passed + checks.failed
     print(f"uc-archiver selftest: {checks.passed} passed, {checks.failed} failed")
     return 1 if checks.failed else 0
