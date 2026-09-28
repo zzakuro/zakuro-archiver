@@ -160,6 +160,34 @@ Editing is driven by a profile, saved per catalogue:
 }
 ```
 
+**Every release also gets the standard set**, without needing a profile:
+
+```
+~Common Redist/     the runtime installers, as a folder
+ReadME.txt          the readme
+```
+
+They are `default_add` on the profile rather than `add`, and are kept out of
+the profile file's `add` list so they are the same on every run. Two reasons
+they are separate:
+
+- **The redist has to stay a folder.** It is added as a source folder, so it
+  arrives as `~Common Redist/` with all ten installers in it and its own
+  name, tilde and all — which is what the people receiving the release need,
+  and what makes the `~` sort to the top of the folder rather than being
+  buried among the game's own directories.
+- **A missing one is a warning, not a failure.** These are absolute paths on
+  one machine. If that Desktop folder moves, you get
+  `standard file not there, skipped: ...` and the release is still built. An
+  explicit `--add` still fails loudly, because that one you asked for by
+  name.
+
+Put a `default_add` in the profile to change or clear the set:
+
+```json
+{ "default_add": ["D:/my/redist"] }
+```
+
 ```bash
 python uc_archiver.py catalogue.json --remove "Online" --save-profile
 python uc_archiver.py catalogue.json --pick 243 --show-profile
@@ -200,7 +228,7 @@ writable layer.
 python selftest.py
 ```
 
-133 checks, none of which touch the network or need an archiver. The store is
+144 checks, none of which touch the network or need an archiver. The store is
 faked at the urlopen boundary, the share page at the session boundary, and the
 download at the same, so the parsing is tested — including the case where the
 page gives no link, which has to be a clear error rather than a silently wrong

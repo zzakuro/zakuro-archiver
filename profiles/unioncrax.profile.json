@@ -3,6 +3,10 @@
     "Online"
   ],
   "add": [],
+  "default_add": [
+    "C:\\Users\\Mfree\\OneDrive\\Desktop\\~Common Redist",
+    "C:\\Users\\Mfree\\OneDrive\\Documents\\zakuro-tool\\ReadME.txt"
+  ],
   "level": "normal",
   "archiver": "",
   "output_dir": "",

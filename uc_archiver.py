@@ -876,7 +876,8 @@ def _is_inside_target(name: str) -> bool:
     return bool(parts) and ".." not in parts
 
 
-def add_files(root: Path, entries: list[str], dry_run: bool = False) -> list[str]:
+def add_files(root: Path, entries: list[str], dry_run: bool = False,
+              required: bool = True) -> list[str]:
     """Copy files and whole folders in, honouring `NAME=path`.
 
     A folder source is copied recursively, so pointing at a prepared
@@ -887,9 +888,16 @@ def add_files(root: Path, entries: list[str], dry_run: bool = False) -> list[str
         name, source = split_extra(entry)
         if not source.exists():
             hint = ""
-            if "=" in entry and not source.exists():
+            if "=" in entry:
                 hint = ("  (if that was meant as NAME=path, the part after the "
                         "'=' does not exist)")
+            if not required:
+                # The standard set lives at absolute paths on one machine. If
+                # that folder has moved, say so and carry on: refusing to build
+                # a release because a Desktop is somewhere else would be a
+                # worse outcome than a release without a readme.
+                warn(f"standard file not there, skipped: {source}{hint}")
+                continue
             raise SystemExit(f"--add: not found: {source}{hint}")
         target = root / name if name else root / source.name
         if dry_run:
@@ -943,10 +951,28 @@ def profile_path(catalogue: Catalogue, base: Path) -> Path:
     return base / f"{slug}.profile.json"
 
 
+# What goes into every release unless a profile says otherwise: the runtime
+# installers as a folder (the people who get the release need them, and a
+# folder of installers is what the folder is for), and the readme.
+#
+# Absolute paths, so they are only true on the machine that set them up. That
+# is why these are added as `required=False`: a Desktop that has moved should
+# cost a warning, not stop every run. An explicit --add still fails loudly,
+# because that one was asked for by name.
+DEFAULT_ADD = [
+    r"C:\Users\Mfree\OneDrive\Desktop\~Common Redist",
+    r"C:\Users\Mfree\OneDrive\Documents\zakuro-tool\ReadME.txt",
+]
+
+
 @dataclass
 class Profile:
     remove: list[str] = field(default_factory=list)
     add: list[str] = field(default_factory=list)
+    # The standard set, added to every release. Separate from `add` because it
+    # is optional: these paths are absolute and only true on one machine, so
+    # one that has moved is a warning rather than a failure.
+    default_add: list[str] = field(default_factory=lambda: list(DEFAULT_ADD))
     level: str = "normal"
     archiver: str = ""
     output_dir: str = ""
@@ -957,6 +983,7 @@ class Profile:
         return {
             "remove": list(self.remove),
             "add": list(self.add),
+            "default_add": list(self.default_add),
             "level": self.level,
             "archiver": self.archiver,
             "output_dir": self.output_dir,
@@ -969,6 +996,8 @@ class Profile:
         return cls(
             remove=[str(x) for x in (data.get("remove") or [])],
             add=[str(x) for x in (data.get("add") or [])],
+            default_add=([str(x) for x in data["default_add"]]
+                         if "default_add" in data else list(DEFAULT_ADD)),
             level=str(data.get("level") or "normal"),
             archiver=str(data.get("archiver") or ""),
             output_dir=str(data.get("output_dir") or ""),
@@ -1093,6 +1122,9 @@ def resolve_settings(args, cat: Catalogue, base: Path) -> tuple[Profile, Path]:
     """
     path = profile_path(cat, base)
     profile = Profile() if args.no_profile else load_profile(path)
+    # A profile saved before this existed carries the standard set implicitly.
+    if profile.default_add is DEFAULT_ADD:
+        profile.default_add = list(DEFAULT_ADD)
     if args.remove is not None:
         profile.remove = list(args.remove)
     if args.add is not None:
@@ -1210,7 +1242,7 @@ def main(argv: list[str] | None = None) -> int:
         say(f"   would unpack     {stem}/")
         for pattern in profile.remove:
             say(f"   would remove     {pattern}")
-        for item in profile.add:
+        for item in list(profile.add) + list(profile.default_add):
             say(f"   would add        {item}")
         say(f"   would write      {out_dir / zakuro_name(stem, ext)}")
         return 0
@@ -1324,9 +1356,18 @@ def main(argv: list[str] | None = None) -> int:
         step("removing")
         for rel in remove_matches(unpack, profile.remove):
             say(f"   - {rel}")
-    if profile.add:
+
+    # --add is what the command line or the profile asked for; the standard
+    # set goes in on top of it, skipping anything already covered so the same
+    # file is not copied twice.
+    asked = list(profile.add)
+    already = {split_extra(a)[1] for a in asked}
+    standard = [e for e in profile.default_add if split_extra(e)[1] not in already]
+    if asked or standard:
         step("adding")
-        for rel in add_files(unpack, profile.add):
+        for rel in add_files(unpack, asked):
+            say(f"   + {rel}")
+        for rel in add_files(unpack, standard, required=False):
             say(f"   + {rel}")
 
     # -- repack ---------------------------------------------------------

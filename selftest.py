@@ -831,6 +831,71 @@ def _edit_checks(checks) -> None:
     _shutil.rmtree(src, ignore_errors=True)
 
 
+def _standard_add_checks(checks) -> None:
+    """The standard set: always added, and a missing one is only a warning.
+
+    These are absolute paths on one machine, so a Desktop that moves must cost
+    a warning rather than stopping every run. An explicit --add is the
+    opposite: it was asked for by name, so not finding it is a failure.
+    """
+    import shutil as _shutil
+    from pathlib import Path as _Path
+
+    checks.check("standard add: the runtime installers are in the set",
+                 any("Common Redist" in e for e in uc.DEFAULT_ADD), str(uc.DEFAULT_ADD))
+    checks.check("standard add: the readme is in the set",
+                 any(e.endswith("ReadME.txt") for e in uc.DEFAULT_ADD), str(uc.DEFAULT_ADD))
+    checks.check("standard add: a fresh profile carries them",
+                 uc.Profile().default_add == list(uc.DEFAULT_ADD))
+    checks.check("standard add: an old profile file without the key still gets them",
+                 uc.Profile.from_dict({"remove": []}).default_add == list(uc.DEFAULT_ADD))
+    checks.check("standard add: a profile that names its own keeps it",
+                 uc.Profile.from_dict(
+                     {"default_add": ["D:/only-this"]}
+                 ).default_add == ["D:/only-this"])
+
+    # The folder has to arrive as a folder, named the same, contents and all.
+    work = _Path(tempfile.mkdtemp(prefix="uc-std-"))
+    try:
+        for e in uc.DEFAULT_ADD:
+            _name, src = uc.split_extra(e)
+            if src.is_dir():
+                got = uc.add_files(work, [e], required=False)
+                target = work / src.name
+                checks.check("standard add: the redist arrives as a folder of its own",
+                             target.is_dir() and got == [src.name],
+                             f"{got} -> dir={target.is_dir()}")
+                checks.check("standard add: named ~Common Redist, tilde and all",
+                             target.name == "~Common Redist", target.name)
+                inside = sorted(p.relative_to(target).as_posix()
+                                for p in target.rglob("*") if p.is_file())
+                checks.check("standard add: the whole folder comes, not one file",
+                             len(inside) > 1, f"{len(inside)} file(s)")
+                _shutil.rmtree(target, ignore_errors=True)
+            else:
+                got = uc.add_files(work, [e], required=False)
+                checks.check("standard add: the readme arrives as a file",
+                             (work / src.name).is_file() and got == [src.name], str(got))
+
+        # A missing one warns and carries on.
+        gone = work / "gone"
+        try:
+            got = uc.add_files(work, [str(gone / "nope.txt")], required=False)
+            checks.check("standard add: a missing entry is skipped, not fatal",
+                         got == [], str(got))
+        except SystemExit as exc:
+            checks.check("standard add: a missing entry is skipped, not fatal",
+                         False, f"raised {exc}")
+        try:
+            uc.add_files(work, [str(gone / "nope.txt")])
+            checks.check("add: an explicit missing path is still fatal", False,
+                         "it did not raise")
+        except SystemExit:
+            checks.check("add: an explicit missing path is still fatal", True)
+    finally:
+        _shutil.rmtree(work, ignore_errors=True)
+
+
 def main() -> int:
     checks = Checks()
     run(checks)
@@ -842,6 +907,7 @@ def main() -> int:
     _free_space_checks(checks)
     _download_totals_checks(checks)
     _edit_checks(checks)
+    _standard_add_checks(checks)
     total = checks.passed + checks.failed
     print(f"uc-archiver selftest: {checks.passed} passed, {checks.failed} failed")
     return 1 if checks.failed else 0
