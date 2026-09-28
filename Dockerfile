@@ -34,8 +34,11 @@ RUN chmod +x /usr/local/bin/rar || true
 
 WORKDIR /app
 
-# The tool itself is one file and needs no install step.
-COPY uc_archiver.py selftest.py ./
+# The tool itself is one file and needs no install step. parallel.py and
+# testserver.py go with it: the first is the downloader, the second is what
+# the self test serves files from, and a container that cannot run its own
+# tests is a container nobody can trust.
+COPY uc_archiver.py parallel.py selftest.py testserver.py ./
 COPY profiles/ ./profiles/
 
 # scrapling pulls curl_cffi and the parser; the [all] extra brings the browser
@@ -50,7 +53,15 @@ VOLUME ["/work"]
 
 ENV PYTHONUNBUFFERED=1 \
     WORK_DIR=/work \
-    OUTPUT_DIR=/work/out
+    OUTPUT_DIR=/work/out \
+    # Connections per download. The host throttles per connection, so this is
+    # the single biggest lever on how long a fetch takes; 1 puts it back to
+    # the old behaviour if a link misbehaves.
+    UC_CONNECTIONS=4 \
+    # Set to a Surge daemon's host:port to hand downloads to it instead.
+    # Unset, the built-in downloader above is used and nothing changes.
+    SURGE_HOST= \
+    SURGE_TOKEN=
 
 # Reports whether the browser this needs is actually usable, which is the one
 # thing that silently fails otherwise.
