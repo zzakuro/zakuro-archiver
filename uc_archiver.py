@@ -83,6 +83,10 @@ RAR_LEVEL = {"store": "-m0", "fast": "-m1", "normal": "-m3", "high": "-m4", "max
 # --------------------------------------------------------------- small helpers
 def say(msg: str) -> None:
     print(msg, flush=True)
+    # Also the active job's log when a job is running, so the console and the
+    # web UI read the same lines rather than one translating the other.
+    import jobs
+    jobs.report(msg)
 
 
 # The downloader logs through this rather than importing it, which would be a
@@ -92,10 +96,19 @@ parallel.report = say
 
 def warn(msg: str) -> None:
     print(f"  ! {msg}", flush=True)
+    import jobs
+    jobs.report(f"  ! {msg}")
 
 
 def step(msg: str) -> None:
-    print(f"\n== {msg}", flush=True)
+    # Every phase begins with one of these, which makes it the one place a stop
+    # request has to be honoured. Checking anywhere else means either missing a
+    # phase or threading the check through every one of them.
+    import jobs
+    jobs.checkpoint()
+    line = f"== {msg} =="
+    jobs.report(line)
+    print(f"\n{line}", flush=True)
 
 
 def human(size: float) -> str:
@@ -1121,6 +1134,13 @@ def build_parser() -> argparse.ArgumentParser:
                     "repack it with the [Zakuro] tag.",
     )
     p.add_argument("catalogue", nargs="?", help="the catalogue .json")
+    g = p.add_argument_group("web interface")
+    g.add_argument("--serve", action="store_true",
+                   help="run the web interface instead of a one-off job")
+    g.add_argument("--host", default="127.0.0.1",
+                   help="address for --serve (default: loopback only; anything "
+                        "else needs UC_TOKEN set)")
+    g.add_argument("--port", type=int, default=8073, help="port for --serve")
     p.add_argument("--pick", metavar="N", help="entry number, as listed by --list")
     p.add_argument("--match", metavar="TEXT", help="pick by title, exactly or in part")
     p.add_argument("--first", action="store_true",
@@ -1245,6 +1265,13 @@ def check_catalogue(cat: Catalogue, viking: Viking) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.serve:
+        import webapp
+        webapp.serve(host=args.host, port=args.port,
+                     token=os.environ.get("UC_TOKEN", ""),
+                     catalogue=args.catalogue,
+                     work_dir=args.work_dir, out_dir=args.output_dir)
+        return 0
     if not args.catalogue:
         build_parser().print_help()
         return 2
@@ -1396,8 +1423,15 @@ def main(argv: list[str] | None = None) -> int:
                 f"not enough room: {human(need)} needed in {work_base}, "
                 f"{human(have)} free"
             )
+    # With a job running the download reports into it and takes its stop flag.
+    # On the plain command line there is no job, so it is None and the
+    # downloader behaves exactly as it always has.
+    import jobs
+    job = jobs.current()
     got = download(share.download_url, download_path, expect=need,
-                   timeout=args.timeout, referer=share.page_url)
+                   timeout=args.timeout, referer=share.page_url,
+                   progress=jobs.bind_progress(job) if job else None,
+                   cancel=job.stop_requested if job else None)
     say(f"   {human(got)} in {download_path.name}")
     if Path(safe_remote).stem.lower() != Path(download_path).stem.lower() and "." in safe_remote:
         say(f"   the host calls it {safe_remote}")
@@ -1448,7 +1482,10 @@ def main(argv: list[str] | None = None) -> int:
     # Narrow on purpose: one top-level directory, and only when stripping UC
     # actually changes its name. A game whose own folder is called "Data" or
     # "bin", or an archive that unpacks to several folders, is left alone.
-    retag = retag_inner_folder(unpack, out_stem)
+    # archive.stem, not out_stem: out_stem is the host's name with "- UC"
+    # still on it, so it is the very folder being renamed and the rename
+    # would always decline. The UC comes off in zakuro_name, above.
+    retag = retag_inner_folder(unpack, archive.stem)
     if retag:
         say(f"   folder inside: {retag[0]} -> {retag[1]}")
 

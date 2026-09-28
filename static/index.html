@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>uc-archiver</title>
+<style>
+  :root {
+    --bg: #14161a; --panel: #1c1f26; --line: #2b303b; --text: #e6e8ec;
+    --dim: #98a0ae; --accent: #6ea8fe; --ok: #57c98a; --warn: #e0b25f;
+    --bad: #e07a7a; --radius: 10px;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f6f7f9; --panel:#fff; --line:#dfe3ea; --text:#1b1e24;
+            --dim:#5c6472; --accent:#2f6fd0; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:15px/1.5 ui-sans-serif,system-ui,"Segoe UI",sans-serif; }
+  header { padding:16px 20px; border-bottom:1px solid var(--line);
+           display:flex; gap:16px; align-items:baseline; flex-wrap:wrap; }
+  h1 { font-size:17px; margin:0; font-weight:600; letter-spacing:.2px; }
+  .dim { color:var(--dim); font-size:13px; }
+  main { display:grid; grid-template-columns: 340px 1fr; gap:16px;
+         padding:16px; align-items:start; }
+  @media (max-width: 820px) { main { grid-template-columns:1fr; } }
+  .panel { background:var(--panel); border:1px solid var(--line);
+           border-radius:var(--radius); overflow:hidden; }
+  .panel h2 { font-size:13px; text-transform:uppercase; letter-spacing:.08em;
+              color:var(--dim); margin:0; padding:12px 14px;
+              border-bottom:1px solid var(--line); }
+  .list { max-height:calc(100vh - 190px); overflow:auto; }
+  .row { padding:9px 14px; border-bottom:1px solid var(--line);
+         display:flex; gap:10px; align-items:center; }
+  .row:last-child { border-bottom:0; }
+  .row.sel { background:color-mix(in srgb, var(--accent) 16%, transparent); }
+  .row .t { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis;
+            white-space:nowrap; }
+  .row .n { color:var(--dim); font-size:12px; font-variant-numeric:tabular-nums; }
+  button { font:inherit; color:var(--text); background:var(--panel);
+           border:1px solid var(--line); border-radius:8px; padding:6px 12px;
+           cursor:pointer; }
+  button:hover:not(:disabled) { border-color:var(--accent); }
+  button:disabled { opacity:.45; cursor:default; }
+  button.go { background:var(--accent); color:#fff; border-color:transparent;
+              font-weight:600; }
+  .job { padding:14px; border-bottom:1px solid var(--line); }
+  .job:last-child { border-bottom:0; }
+  .job .head { display:flex; gap:10px; align-items:center; }
+  .job .head .t { flex:1; min-width:0; overflow:hidden;
+                  text-overflow:ellipsis; white-space:nowrap; }
+  .bar { height:8px; background:var(--line); border-radius:99px;
+         overflow:hidden; margin:10px 0 6px; }
+  .bar > i { display:block; height:100%; background:var(--accent);
+             transition:width .25s ease; }
+  .state-DONE .bar > i { background:var(--ok); }
+  .state-FAILED .bar > i { background:var(--bad); }
+  .state-CANCELLED .bar > i { background:var(--warn); }
+  .meta { display:flex; gap:14px; flex-wrap:wrap; color:var(--dim);
+          font-size:12px; font-variant-numeric:tabular-nums; }
+  .tag { font-size:11px; text-transform:uppercase; letter-spacing:.07em;
+         padding:2px 7px; border-radius:99px; border:1px solid var(--line);
+         color:var(--dim); }
+  .state-DONE .tag { color:var(--ok); border-color:var(--ok); }
+  .state-FAILED .tag { color:var(--bad); border-color:var(--bad); }
+  .state-CANCELLED .tag { color:var(--warn); border-color:var(--warn); }
+  pre { margin:10px 0 0; padding:10px; background:var(--bg); color:var(--dim);
+        border-radius:8px; max-height:210px; overflow:auto; font-size:12px;
+        white-space:pre-wrap; word-break:break-word; }
+  .err { color:var(--bad); margin-top:8px; font-size:13px; }
+  .empty { padding:22px 14px; color:var(--dim); text-align:center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>uc-archiver</h1>
+  <span class="dim" id="status">connecting…</span>
+  <span style="flex:1"></span>
+  <button id="clear">Clear finished</button>
+  <button id="go" class="go" disabled>Run selected</button>
+</header>
+<main>
+  <section class="panel">
+    <h2>Catalogue</h2>
+    <div class="list" id="entries"><div class="empty">loading…</div></div>
+  </section>
+  <section class="panel">
+    <h2>Runs</h2>
+    <div id="jobs"><div class="empty">nothing running yet</div></div>
+  </section>
+</main>
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+const el = (t, c, x) => { const n = document.createElement(t);
+  if (c) n.className = c; if (x !== undefined) n.textContent = x; return n; };
+
+// A token typed once sticks for the session. Without one, the API is open
+// to anything that can reach the port, which is fine on loopback and not
+// fine anywhere else.
+const TOKEN_KEY = "uc.token";
+function token() { return sessionStorage.getItem(TOKEN_KEY) || ""; }
+async function api(path, opts = {}) {
+  const headers = Object.assign({}, opts.headers || {});
+  if (token()) headers["Authorization"] = "Bearer " + token();
+  if (opts.body) headers["Content-Type"] = "application/json";
+  const r = await fetch(path, Object.assign({}, opts, { headers }));
+  if (r.status === 401) {
+    const t = prompt("This server wants a token:");
+    if (t) { sessionStorage.setItem(TOKEN_KEY, t); return api(path, opts); }
+    throw new Error("no token");
+  }
+  return r.json();
+}
+
+function bytes(n) {
+  if (!n) return "0 B";
+  const u = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let i = 0, v = n;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (i === 0 ? v.toFixed(0) : v.toFixed(1)) + " " + u[i];
+}
+function when(sec) {
+  if (sec === null || sec === undefined) return "—";
+  sec = Math.round(sec);
+  if (sec < 60) return sec + "s";
+  if (sec < 3600) return Math.floor(sec / 60) + "m " + (sec % 60) + "s";
+  return Math.floor(sec / 3600) + "h " + Math.floor((sec % 3600) / 60) + "m";
+}
+
+let selected = null;
+const streams = new Map();
+
+async function loadStatus() {
+  try {
+    const s = await api("/api/status");
+    const bits = [];
+    if (s.connections) bits.push(s.connections + " connections");
+    if (s.surge_host) bits.push("surge: " + s.surge_host);
+    if (s.scrapling) bits.push("browser: " + s.scrapling);
+    $("#status").textContent = bits.length ? bits.join(" · ") : "ready";
+  } catch (e) { $("#status").textContent = "cannot reach the server"; }
+}
+
+async function loadEntries() {
+  const box = $("#entries");
+  try {
+    const cat = await api("/api/catalogue");
+    if (cat.error) { box.replaceChildren(el("div", "empty", cat.error)); return; }
+    box.replaceChildren();
+    for (const e of cat.entries) {
+      const row = el("div", "row");
+      row.append(el("div", "t", e.title), el("div", "n", e.declared_size_text || ""));
+      row.onclick = () => {
+        selected = e.index;
+        box.querySelectorAll(".row").forEach((r) => r.classList.remove("sel"));
+        row.classList.add("sel");
+        $("#go").disabled = false;
+      };
+      box.append(row);
+    }
+    if (!cat.entries.length) box.replaceChildren(el("div", "empty", "no entries"));
+  } catch (e) { box.replaceChildren(el("div", "empty", "cannot load the catalogue")); }
+}
+
+function renderJob(j) {
+  let node = document.getElementById("job-" + j.id);
+  if (!node) {
+    node = el("div", "job");
+    node.id = "job-" + j.id;
+    $("#jobs").replaceChildren();
+  }
+  node.className = "job state-" + j.state;
+  node.replaceChildren();
+  const head = el("div", "head");
+  head.append(el("div", "t", j.title), el("span", "tag", j.state));
+  if (j.cancellable) {
+    const stop = el("button", "", "Stop");
+    stop.onclick = async () => { await api("/api/jobs/" + j.id + "/cancel", { method: "POST" }); };
+    head.append(stop);
+  }
+  node.append(head);
+
+  const bar = el("div", "bar");
+  const fill = el("i");
+  fill.style.width = Math.round(Math.max(0, Math.min(1, j.fraction)) * 100) + "%";
+  bar.append(fill);
+  node.append(bar);
+
+  const meta = el("div", "meta");
+  meta.append(el("span", "", j.phase || "—"));
+  if (j.total) {
+    meta.append(el("span", "", bytes(j.done) + " / " + bytes(j.total)));
+    meta.append(el("span", "", bytes(j.rate) + "/s"));
+  }
+  meta.append(el("span", "", when(j.seconds)));
+  if (j.eta !== null && j.eta !== undefined && j.cancellable) {
+    meta.append(el("span", "", "left " + when(j.eta)));
+  }
+  node.append(meta);
+  if (j.error) node.append(el("div", "err", j.error));
+  if (j.log && j.log.length) node.append(el("pre", "", j.log.join("\n")));
+  return node;
+}
+
+function watch(job) {
+  if (streams.has(job.id)) return;
+  const src = new EventSource("/api/jobs/" + job.id + "/events");
+  streams.set(job.id, src);
+  src.onmessage = (e) => {
+    const j = JSON.parse(e.data);
+    renderJob(j);
+    if (!j.cancellable) { src.close(); streams.delete(job.id); }
+  };
+  src.onerror = () => { src.close(); streams.delete(job.id); poll(); };
+}
+
+async function poll() {
+  let jobs = [];
+  try { jobs = await api("/api/jobs"); } catch (e) { return; }
+  if (!jobs.length) { $("#jobs").replaceChildren(el("div", "empty", "nothing running yet")); return; }
+  const box = $("#jobs");
+  box.replaceChildren();
+  for (const j of jobs.reverse()) { box.append(renderJob(j)); if (j.cancellable) watch(j); }
+}
+
+$("#go").onclick = async () => {
+  if (selected === null) return;
+  $("#go").disabled = true;
+  try {
+    const j = await api("/api/jobs", { method: "POST", body: JSON.stringify({ index: selected }) });
+    renderJob(j); watch(j);
+  } catch (e) { alert("could not start: " + e.message); }
+  $("#go").disabled = false;
+};
+$("#clear").onclick = async () => { await api("/api/jobs/clear", { method: "POST" }); poll(); };
+
+loadStatus(); loadEntries(); poll();
+setInterval(poll, 4000);
+</script>
+</body>
+</html>

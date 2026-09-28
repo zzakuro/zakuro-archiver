@@ -145,6 +145,69 @@ def split_span(start: int, end: int, parts: int) -> list[Span]:
     return spans
 
 
+def spans_file(dest: Path) -> Path:
+    """The sidecar that says which spans of `dest` really hold bytes.
+
+    A partial file cannot be trusted on its size alone. Preallocating makes it
+    the full length before a single byte arrives, so a run that dies after
+    preallocating leaves a file that is exactly the right size and entirely
+    holes -- and a later run that checks only the size calls that a finished
+    download. It happened here: 284 MB of zeros, reported as 271.5 MB
+    downloaded, and the archive would not open.
+
+    So the spans that were genuinely written are recorded here, and resume
+    asks this rather than the file size.
+    """
+    return dest.with_name(dest.name + ".spans")
+
+
+def read_spans(dest: Path) -> list[tuple[int, int]]:
+    path = spans_file(dest)
+    try:
+        out = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            a, _, b = line.partition(" ")
+            if a.isdigit() and b.isdigit():
+                out.append((int(a), int(b)))
+        return out
+    except (OSError, ValueError):
+        return []
+
+
+def write_spans(dest: Path, spans: list[tuple[int, int]]) -> None:
+    try:
+        spans_file(dest).write_text(
+            "".join(f"{a} {b}\n" for a, b in sorted(spans)), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def missing_spans(dest: Path, total: int, wanted: int) -> list[Span]:
+    """What still has to be fetched, given what the sidecar says is there."""
+    have = sorted(read_spans(dest))
+    if not have:
+        # No record at all. Either a fresh file, or one whose sidecar was lost
+        # -- and a full-length file with no record is the preallocated case
+        # that is not a download, so it is thrown away rather than believed.
+        if dest.is_file() and dest.stat().st_size >= total > 0:
+            try:
+                dest.unlink()
+            except OSError:
+                pass
+        return [Span(0, total - 1)] if wanted <= 1 else split_span(0, total - 1, wanted)
+    covered = sum(b - a + 1 for a, b in have)
+    todo: list[Span] = []
+    at = 0
+    for a, b in have:
+        if a > at:
+            todo.append(Span(at, a - 1))
+        at = max(at, b + 1)
+    if at < total:
+        todo.append(Span(at, total - 1))
+    report(f"   resuming at {human(covered)} of {human(total)}")
+    return todo
+
+
 def _open(url: str, span: Span | None, referer: str, timeout: int):
     headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
     if referer:
@@ -203,7 +266,8 @@ def _fetch_span(url: str, dest: Path, span: Span, referer: str, timeout: int,
                 break
             handle.write(block)
             written += len(block)
-            progress.advance(len(block))
+            if progress is not None:
+                progress.advance(len(block))
     if written != span.length:
         raise OSError(
             f"chunk {span.header} came back short: {written} of {span.length} bytes"
@@ -216,27 +280,30 @@ def fetch_parallel(url: str, dest: Path, total: int, connections: int = DEFAULT_
                    progress: Progress | None = None) -> int:
     """Fetch `url` into `dest` with several connections. Returns the size.
 
-    `total` is the whole file, and the first `dest.stat().st_size` bytes are
-    assumed to be there already, which is what makes this resume as well as
-    parallel.
+    `total` is the whole file. What is already there is taken from the sidecar
+    rather than the file size, so a run that died after preallocating is not
+    mistaken for a finished download.
     """
-    progress = progress or Progress(total=total)
-    have = dest.stat().st_size if dest.is_file() else 0
-    if have >= total:
-        return have
-    if have:
-        report(f"   resuming at {human(have)} of {human(total)}")
+    if progress is None:
+        progress = Progress(total=total)
+    else:
+        # A caller that brought its own progress (a job) still has to learn the
+        # total, or the bar measures against nothing.
+        progress.total = total
 
-    spans = split_span(have, total - 1, connections)
-    if not spans:
-        return have
+    done_spans = list(read_spans(dest))
+    todo = missing_spans(dest, total, connections)
+    if not todo:
+        return dest.stat().st_size if dest.is_file() else 0
 
-    # Sized up front so no thread is extending the file past the end while
-    # another is still filling in earlier bytes.
+    # Sized up front so no thread extends the file past the end while another
+    # is still filling in earlier bytes.
+    dest.parent.mkdir(parents=True, exist_ok=True)
     with open(dest, "ab") as handle:
         handle.truncate(total)
 
     stop = threading.Event()
+    lock = threading.Lock()
 
     def share_cancel() -> bool:
         if cancel is not None and cancel():
@@ -247,21 +314,45 @@ def fetch_parallel(url: str, dest: Path, total: int, connections: int = DEFAULT_
         if stop.is_set():
             raise DownloadCancelled()
         with open(dest, "r+b") as handle:      # this thread's own handle
-            return _fetch_span(url, dest, span, referer, timeout,
-                               progress, share_cancel, handle)
+            written = _fetch_span(url, dest, span, referer, timeout,
+                                  progress, share_cancel, handle)
+        # Recorded only once the span is complete, so the sidecar never claims
+        # bytes that are not there.
+        with lock:
+            done_spans.append((span.start, span.end))
+            write_spans(dest, done_spans)
+        return written
 
     try:
-        with ThreadPoolExecutor(max_workers=len(spans)) as pool:
-            for _ in pool.map(worker, spans):
+        with ThreadPoolExecutor(max_workers=len(todo)) as pool:
+            for _ in pool.map(worker, todo):
                 pass
-    except RangeUnsupported:
-        # Nothing usable was written at the offsets, but the preallocation
-        # left a sparse file behind. Hand it back to the caller as a failure
-        # so the single-connection path starts from a clean slate.
+    except DownloadCancelled:
+        # A stop is not a failure. What was fetched is real and the sidecar
+        # says which parts, so it is kept and a later run carries on from
+        # here rather than starting the file again.
         raise
-    finally:
-        pass
+    except RangeUnsupported:
+        # The offsets it wrote mean nothing, so the preallocated file has to go
+        # rather than be handed on as a download.
+        _discard(dest)
+        raise
+    except BaseException:
+        # A real failure. The file is the right length and full of holes, and
+        # a size check alone would take it for a finished download next time.
+        _discard(dest)
+        raise
+    spans_file(dest).unlink(missing_ok=True)
     return dest.stat().st_size
+
+
+def _discard(dest: Path) -> None:
+    """Throw away a partial file that must not be believed or resumed."""
+    for path in (dest, spans_file(dest)):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def fetch_single(url: str, dest: Path, expect: int = 0, timeout: int = 60,

@@ -14,6 +14,7 @@ import json
 import shutil
 import sys
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -979,6 +980,17 @@ def _inner_folder_checks(checks) -> None:
     checks.check("inner folder: a branded folder takes the tag",
                  got == ("Touhou Luna Nights - UC", "Touhou Luna Nights [Zakuro]")
                  and dirs == ["Touhou Luna Nights [Zakuro]"], f"{got} -> {dirs}")
+
+    # The one that got through. The rename was handed the host's own stem --
+    # still carrying "- UC" -- which is the very folder being renamed, so the
+    # "does that name already exist" check always fired and nothing moved. The
+    # archive came out named "[Zakuro]" with a "- UC" folder inside it.
+    raw = make(["Hollow Knight - UC"])
+    uc.retag_inner_folder(raw, "Hollow Knight - UC")
+    checks.check("inner folder: renaming onto the name it already has is a no-op",
+                 (raw / "Hollow Knight - UC").is_dir()
+                 and len([p for p in raw.iterdir() if p.is_dir()]) == 1)
+    _shutil.rmtree(raw, ignore_errors=True)
     checks.check("inner folder: and its contents came with it",
                  (root / "Touhou Luna Nights [Zakuro]" / "data" / "f.txt").is_file())
     _shutil.rmtree(root, ignore_errors=True)
@@ -1112,6 +1124,34 @@ def _parallel_download_checks(checks) -> None:
             srv.close()
 
         # -- splitting ---------------------------------------------------
+
+        # A preallocated file with no record is the dangerous one. It is the
+        # exact length of the real download and holds nothing but holes, and a
+        # size check alone takes it for a finished one. That happened: a run
+        # died after preallocating, and the next run reported 271.5 MB
+        # downloaded and handed a file of zeros to the extractor.
+        fake = work / "preallocated.bin"
+        with open(fake, "ab") as h:
+            h.truncate(len(payload))
+        checks.check("resume: a full-length file with no record is not a download",
+                     parallel.read_spans(fake) == []
+                     and fake.stat().st_size == len(payload))
+        todo = parallel.missing_spans(fake, len(payload), 4)
+        checks.check("resume: so it is thrown away and fetched whole",
+                     not fake.exists() and sum(t.length for t in todo) == len(payload),
+                     f"exists={fake.exists()} spans={todo}")
+
+        # A recorded partial, on the other hand, is believed -- that is the
+        # whole point of keeping it when a run is stopped.
+        real_partial = work / "real.bin"
+        real_partial.write_bytes(payload[:len(payload) // 3])
+        parallel.write_spans(real_partial, [(0, len(payload) // 3 - 1)])
+        todo = parallel.missing_spans(real_partial, len(payload), 4)
+        checks.check("resume: a recorded partial is kept and only the rest fetched",
+                     real_partial.exists()
+                     and sum(t.length for t in todo) == len(payload) - len(payload) // 3,
+                     f"left={sum(t.length for t in todo)}")
+
         spans = parallel.split_span(0, 99, 4)
         checks.check("split: four spans cover the range exactly",
                      sum(s.length for s in spans) == 100
@@ -1129,6 +1169,75 @@ def _parallel_download_checks(checks) -> None:
         _shutil.rmtree(work, ignore_errors=True)
 
 
+def _job_checks(checks) -> None:
+    """A job, and the two ways it talks to the downloader.
+
+    Both bugs here were the same mistake in opposite directions: a callable
+    where a value was expected, and a value where a callable was expected. The
+    second one is the nastier, because a bound method is truthy -- passing one
+    where a bool was wanted cancels every download the instant it starts, and
+    nothing in a normal run says why.
+    """
+    import jobs
+
+    mgr = jobs.JobManager()
+    seen: list[bool] = []
+
+    def work(job: jobs.Job) -> str:
+        seen.append(job.stop_requested())
+        return "done"
+
+    job = mgr.submit(0, "probe", work)
+    for _ in range(100):
+        if job.state in (jobs.DONE, jobs.FAILED):
+            break
+        time.sleep(0.05)
+    checks.check("job: a fresh job is not cancelled",
+                 seen and seen[0] is False, str(seen[:2]))
+    checks.check("job: stop_requested answers with a bool, not a method",
+                 isinstance(job.stop_requested(), bool),
+                 type(job.stop_requested()).__name__)
+    checks.check("job: it runs to done", job.state == jobs.DONE,
+                 f"{job.state} {job.error}")
+
+    # Cancelling a job mid-flight.
+    slow = jobs.JobManager()
+
+    def waiter(job: jobs.Job) -> str:
+        for _ in range(200):
+            job.checkpoint()
+            time.sleep(0.02)
+        return "ran to the end"
+
+    job2 = slow.submit(1, "slow", waiter)
+    time.sleep(0.2)
+    checks.check("job: cancel is accepted while running", slow.cancel(job2.id))
+    for _ in range(100):
+        if job2.state in (jobs.CANCELLED, jobs.DONE, jobs.FAILED):
+            break
+        time.sleep(0.05)
+    checks.check("job: and it ends cancelled, not failed",
+                 job2.state == jobs.CANCELLED, f"{job2.state} {job2.error}")
+    checks.check("job: a finished job cannot be cancelled",
+                 not slow.cancel(job2.id))
+    checks.check("job: its progress is a real fraction",
+                 0.0 <= job2.fraction <= 1.0, str(job2.fraction))
+    checks.check("job: clearing takes finished ones away",
+                 slow.clear_finished() >= 1 and not slow.get(job2.id))
+    checks.check("job: a new manager is not the same one",
+                 jobs.JobManager() is not slow)
+
+    # A job that died part way is not a job that finished, and a bar that says
+    # otherwise sends somebody looking for the last 80%.
+    dead = jobs.Job(id="x", index=9, title="t", state=jobs.FAILED)
+    dead.set_progress(30, 300)
+    checks.check("job: a failed bar is not full",
+                 dead.fraction < 0.99 and dead.fraction > 0.1, str(dead.fraction))
+    checks.check("job: a cancelled bar is not full either",
+                 (setattr(dead, "state", jobs.CANCELLED),
+                  dead.fraction < 0.99)[1], str(dead.fraction))
+
+
 def main() -> int:
     checks = Checks()
     run(checks)
@@ -1144,6 +1253,7 @@ def main() -> int:
     _naming_and_sweep_checks(checks)
     _inner_folder_checks(checks)
     _parallel_download_checks(checks)
+    _job_checks(checks)
     total = checks.passed + checks.failed
     print(f"uc-archiver selftest: {checks.passed} passed, {checks.failed} failed")
     return 1 if checks.failed else 0
