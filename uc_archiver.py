@@ -920,6 +920,8 @@ def build_parser() -> argparse.ArgumentParser:
     g = p.add_argument_group("where things live")
     g.add_argument("--work-dir", help="where to download and unpack (default: a temp folder)")
     g.add_argument("--output-dir", help="where the finished archive goes (default: next to the work dir)")
+    g.add_argument("--force", action="store_true",
+                   help="replace an output archive that already exists")
     g.add_argument("--keep-download", action="store_true",
                    help="keep the downloaded archive after repacking")
 
@@ -1077,6 +1079,19 @@ def main(argv: list[str] | None = None) -> int:
         say(f"   would write      {out_dir / zakuro_name(stem, ext)}")
         return 0
 
+    # -- is there already one of these? ---------------------------------
+    # Asked here, before anything is fetched, because the answer does not
+    # change between now and the repack. Checking it at the end instead means
+    # downloading an entry -- these run to 155 GB -- only to throw the result
+    # away and leave the download on disk. The same question is asked again
+    # just before the move, in case something else wrote there meanwhile.
+    archive = out_dir / zakuro_name(stem, ext)
+    if archive.exists() and not args.force:
+        raise SystemExit(
+            f"{archive.name} is already there. Pass --force to replace it, or "
+            f"--output-dir somewhere else to keep both."
+        )
+
     # -- wait for it ----------------------------------------------------
     step("waiting for the file to be available")
     info = Viking(timeout=args.timeout).wait_until_ready(entry.hash)
@@ -1175,23 +1190,48 @@ def main(argv: list[str] | None = None) -> int:
     # -- repack ---------------------------------------------------------
     step("repacking")
     out_dir.mkdir(parents=True, exist_ok=True)
-    archive = out_dir / zakuro_name(stem, ext)
+    # Asked again here, having been asked before the download. Cheap, and it
+    # is the last point at which refusing costs nothing.
     if archive.exists():
+        if not args.force:
+            raise SystemExit(
+                f"{archive.name} appeared while this was running. Pass --force "
+                f"to replace it."
+            )
         warn(f"{archive.name} exists, replacing it")
         archive.unlink()
-    archiver.pack(unpack, archive, level=profile.level, test=not args.no_test)
-    say(f"   {archive}  {human(archive.stat().st_size)}")
+    # Written beside the output and moved into place at the end, so a pack that
+    # fails or is interrupted cannot leave a half-written archive under the
+    # name of a finished one.
+    staging = archive.with_name(archive.name + ".partial")
+    if staging.exists():
+        staging.unlink()
+    archiver.pack(unpack, staging, level=profile.level, test=not args.no_test)
+    say(f"   {staging.name}  {human(staging.stat().st_size)}")
     if not args.no_test:
         say("   verified")
 
     # -- tidy -----------------------------------------------------------
-    shutil.rmtree(unpack, ignore_errors=True)
+    # The two things that went into the archive, gone now that it is written:
+    # the download it came from and the unpacked copy of it. Together they are
+    # roughly twice the size of the finished archive and neither is wanted
+    # afterwards; the download in particular is the thing that fills a disk
+    # over a run through a catalogue.
+    #
+    # The move happens first, so the archive is only taken away once there is
+    # a good one where it belongs.
+    staging.replace(archive)
+    say(f"   {archive.name}  {human(archive.stat().st_size)}")
     if not profile.keep_download:
         try:
             download_path.unlink()
-            say(f"   removed {download_path.name}")
         except OSError:
-            pass
+            warn(f"could not remove {download_path.name}; it is still there")
+    if unpack.exists():
+        shutil.rmtree(unpack, ignore_errors=True)
+        if unpack.exists():
+            warn(f"could not remove the unpacked folder {unpack.name}; "
+                 f"it is still there")
 
     say(f"\ndone: {archive}")
     return 0
