@@ -1827,32 +1827,51 @@ def _span_retry_scenarios(checks, tmp: Path, parallel, Server, threading) -> Non
     real_free = uc.free_bytes
     try:
         uc.free_bytes = lambda p: 10_000
-        first = uc._claim_room(base, 4_000, "first")
-        checks.check("room: a run that fits is allowed in", first == 4_000,
-                     str(first))
-        second = uc._claim_room(base, 4_000, "second")
-        checks.check("room: and the next one too, there is room for both",
-                     second == 4_000, str(second))
+        with uc._RoomClaim(base, 4_000, "first"):
+            checks.check("room: a run that fits is allowed in",
+                         uc._room_others_hold() == 4_000,
+                         str(uc._room_others_hold()))
+            with uc._RoomClaim(base, 4_000, "second"):
+                checks.check("room: and the next one too, room for both",
+                             uc._room_others_hold() == 8_000,
+                             str(uc._room_others_hold()))
+                try:
+                    with uc._RoomClaim(base, 4_000, "third"):
+                        outcome = "allowed"
+                except SystemExit as exc:
+                    outcome = str(exc)
+                checks.check("room: a third is refused, the first two took it",
+                             outcome != "allowed", outcome[:90])
+                checks.check("room: and the refusal says what is claimed",
+                             "claimed" in outcome, outcome[:90])
+            # The inner one is given back, so the next run fits.
+            checks.check("room: leaving the inner block gives the room back",
+                         uc._room_others_hold() == 4_000,
+                         str(uc._room_others_hold()))
+            with uc._RoomClaim(base, 4_000, "third"):
+                checks.check("room: and the next run fits once one finishes",
+                             uc._room_others_hold() == 8_000,
+                             str(uc._room_others_hold()))
+        # A run that dies still gives its claim back, or it shrinks the disk
+        # for everything queued behind it.
+        checks.check("room: a finished run leaves nothing claimed",
+                     uc._room_others_hold() == 0, str(uc._room_others_hold()))
         try:
-            uc._claim_room(base, 4_000, "third")
-            outcome = "allowed"
-        except SystemExit as exc:
-            outcome = str(exc)
-        checks.check("room: a third is refused, the first two took the room",
-                     outcome != "allowed", outcome[:90])
-        checks.check("room: and the refusal says what is already claimed",
-                     "claimed" in outcome, outcome[:90])
-        uc._release_room(first)
-        third = uc._claim_room(base, 4_000, "third")
-        checks.check("room: and it fits once the first finishes",
-                     third == 4_000, str(third))
-        uc._release_room(second)
-        uc._release_room(third)
+            with uc._RoomClaim(base, 4_000, "doomed"):
+                raise SystemExit("something went wrong mid-run")
+        except SystemExit:
+            pass
+        checks.check("room: a run that fails gives its claim back too",
+                     uc._room_others_hold() == 0, str(uc._room_others_hold()))
         # Unreadable free space is a skipped check, never a refusal.
         uc.free_bytes = lambda p: None
-        checks.check("room: a volume that cannot be measured is not a refusal",
-                     uc._claim_room(base, 99_000_000, "blind") is None,
-                     "refused")
+        with uc._RoomClaim(base, 99_000_000, "blind") as claim:
+            checks.check("room: a volume that cannot be measured is not a "
+                         "refusal", claim.amount == 0, str(claim.amount))
+        # Asking for nothing is not a refusal either.
+        with uc._RoomClaim(base, 0, "nothing"):
+            checks.check("room: a run that needs no room claims none",
+                         uc._room_others_hold() == 0, str(uc._room_others_hold()))
     finally:
         uc.free_bytes = real_free
         _sh.rmtree(base, ignore_errors=True)

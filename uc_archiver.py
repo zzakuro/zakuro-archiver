@@ -149,6 +149,61 @@ _room_lock = threading.Lock()
 _room_claimed = 0
 
 
+class _RoomClaim:
+    """Hold this run's share of the disk until it ends, however it ends.
+
+    The check used to be each run looking at the volume and each passing, which
+    is fine for one download and wrong for several. The claim is taken against a
+    shared total, so the second run in a queue is measured against what the
+    first one is really using rather than against a number that is about to stop
+    being true. It is given back on the way out, including on a failure, so a
+    run that dies does not shrink the disk for everything after it.
+
+    A volume that cannot be measured is a skipped check and says so, rather than
+    a refusal: an unreadable disk is not a full one, and treating it as full
+    would stop every run on it.
+    """
+
+    def __init__(self, base: Path, want: int, label: str) -> None:
+        self.base, self.want, self.label = base, want, label
+        self.amount = 0
+
+    def __enter__(self) -> "_RoomClaim":
+        global _room_claimed
+        if not self.want:
+            return self
+        have = free_bytes(self.base)
+        if have is None:
+            warn(f"could not read the free space on {self.base}, so the room "
+                 f"check is being skipped")
+            return self
+        with _room_lock:
+            room = have - _room_claimed
+            if room < self.want * 1.05:
+                raise SystemExit(
+                    f"not enough room for {self.label}: {human(self.want)} "
+                    f"needed, {human(room)} free once {human(_room_claimed)} "
+                    f"is already claimed by other runs in {self.base}"
+                )
+            _room_claimed += self.want
+            self.amount = self.want
+        return self
+
+    def __exit__(self, *_exc) -> bool:
+        global _room_claimed
+        if self.amount:
+            with _room_lock:
+                _room_claimed = max(0, _room_claimed - self.amount)
+            self.amount = 0
+        return False
+
+
+def _room_others_hold() -> int:
+    """Bytes other runs in this process have claimed."""
+    with _room_lock:
+        return _room_claimed
+
+
 # ------------------------------------------------------------------- catalogue
 @dataclass
 class Entry:
@@ -1623,84 +1678,29 @@ def main(argv: list[str] | None = None) -> int:
     remote_ext = Path(safe_remote).suffix or ext
     download_path = work_base / f"{stem}.download{remote_ext}"
     need = remote_size or 0
-    # Room for the download, the unpacked tree and the finished archive, all at
-    # once -- a 3.1 MB .7z in this catalogue held 73.7 MB, and the archive is
-    # asked what it expands to rather than having it guessed.
-    want = need
-    if need and download_path.suffix.lower() in (".7z", ".zip"):
+    # Room claimed for this run and given back when it ends, whichever way it
+    # ends. The download, the unpacked tree and the finished archive all have to
+    # fit at once -- a 3.1 MB .7z in this catalogue held 73.7 MB.
+    #
+    # A context manager rather than a helper function on purpose: this part of
+    # main is long, and splitting it out meant passing a dozen names across by
+    # hand. Two of them were missed, and a dry run cannot see either, because it
+    # returns before here.
+    with _RoomClaim(work_base, need, stem):
+        import jobs
+        job = jobs.current()
+        # Held for the whole run, not just the fetch: two runs of one entry
+        # deadlock on the shared partial, and a hang with no error is a bad
+        # thing to hand someone.
         try:
-            want += archiver.unpacked_size(download_path) or 0
-        except Exception:
-            pass                       # unknown until it is there; the download
-                                        # size alone is still checked
-    reservation = _claim_room(work_base, want, stem) if want else None
-    try:
-        return _run_from_download(share, args, profile, work_base, out_dir,
-                                  stem, ext, archiver, download_path, need,
-                                  remote_name, reservation)
-    finally:
-        if reservation:
-            _release_room(reservation)
-
-
-def _claim_room(base: Path, want: int, label: str):
-    """Reserve disk for this run, counting what other runs have already taken.
-
-    The check used to be each run looking at the whole disk and each passing.
-    That is fine for one download and wrong for several: ten runs each wanting
-    12 GB all see the same free space and all agree there is room, and then the
-    volume fills. The claim is taken against a shared total and given back when
-    the run ends, so the second run in a queue is measured against what the
-    first one is really using rather than against a number that is about to
-    stop being true.
-
-    Returns None when the free space cannot be read, which the caller reports
-    as a skipped check rather than a failure -- the same as before.
-    """
-    global _room_claimed
-    have = free_bytes(base)
-    if have is None:
-        warn(f"could not read the free space on {base}, so the room check is "
-             f"being skipped")
-        return None
-    with _room_lock:
-        room = have - _room_claimed
-        if room < want * 1.05:
-            raise SystemExit(
-                f"not enough room for {label}: {human(want)} needed, "
-                f"{human(room)} free once {human(_room_claimed)} already "
-                f"claimed by other runs in {base}"
-            )
-        _room_claimed += want
-    return want
-
-
-def _release_room(amount: int) -> None:
-    global _room_claimed
-    with _room_lock:
-        _room_claimed = max(0, _room_claimed - amount)
-
-
-def _run_from_download(share, args, profile, work_base, out_dir, stem, ext,
-                       archiver, download_path, need, remote_name, reservation):
-    """The rest of the run, once the room for it has been claimed."""
-    # With a job running the download reports into it and takes its stop flag.
-    # On the plain command line there is no job, so it is None and the
-    # downloader behaves exactly as it always has.
-    import jobs
-    job = jobs.current()
-    # Held for the whole run, not just the fetch: two runs of one entry
-    # deadlock on the shared partial, and a hang with no error is a bad
-    # thing to hand someone.
-    try:
-        with _RunLock(download_path, remote_name):
-            got = download(share.download_url, download_path, expect=need,
-                           timeout=args.timeout, referer=share.page_url,
-                           progress=jobs.bind_progress(job) if job else None,
-                           cancel=job.stop_requested if job else None)
-    except AlreadyRunning as exc:
-        raise SystemExit(str(exc))
-    say(f"   {human(got)} in {download_path.name}")
+            with _RunLock(download_path, safe_remote):
+                got = download(share.download_url, download_path, expect=need,
+                               timeout=args.timeout, referer=share.page_url,
+                               progress=jobs.bind_progress(job) if job else None,
+                               cancel=job.stop_requested if job else None)
+        except AlreadyRunning as exc:
+            raise SystemExit(str(exc))
+        say(f"   {human(got)} in {download_path.name}")
 
     if Path(safe_remote).stem.lower() != Path(download_path).stem.lower() and "." in safe_remote:
         say(f"   the host calls it {safe_remote}")
@@ -1717,7 +1717,12 @@ def _run_from_download(share, args, profile, work_base, out_dir, stem, ext,
     # step would then repack as if it were the whole game.
     expand = archiver.unpacked_size(download_path)
     if expand:
-        room = free_bytes(work_base)
+        free = free_bytes(work_base)
+        # What other runs in this process have claimed is not free to this one,
+        # so the room left is the volume minus their claims. Reading the volume
+        # on its own is the bug this fixes: ten runs each seeing the same number
+        # all agree there is room, and then the volume fills.
+        room = None if free is None else free - _room_others_hold()
         # The download, the unpacked tree and the finished archive all have to
         # fit at once, plus slack: the repack is written to the same volume and
         # a .rar of a .7z is not reliably smaller.
