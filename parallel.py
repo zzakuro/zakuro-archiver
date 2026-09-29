@@ -34,6 +34,7 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from typing import Any
 
 CHUNK_READ = 1 << 20
 DEFAULT_CONNECTIONS = 4
@@ -53,6 +54,75 @@ def _say(_message: str) -> None:
 
 
 report = _say
+
+# The progress line is redrawn at most this often. Every worker thread calls
+# advance() on every megabyte it reads, so without a throttle four threads on a
+# fast link would spend more time writing the bar than moving the file.
+DRAW_INTERVAL = 0.1
+
+# Which Progress is currently holding the terminal's bottom line, so a log line
+# can wipe it before printing rather than landing in the middle of it. One at a
+# time: two downloads in one terminal is two bars fighting over the same row.
+_drawing: "Progress | None" = None
+_draw_guard = threading.Lock()
+
+
+def clear_bar() -> None:
+    """Erase the progress line, if one is on screen.
+
+    Called by the pipeline before it prints anything. The next chunk redraws,
+    so this is only about the line that is already there -- without it a
+    warning lands mid-bar and both become unreadable.
+    """
+    global _drawing
+    with _draw_guard:
+        bar, _drawing = _drawing, None
+    if bar is None or bar.stream is None or not bar._painted:
+        return
+    bar.stream.write("\r" + " " * (bar._painted + 1) + "\r")
+    bar.stream.flush()
+    bar._painted = 0
+
+
+def human_rate(per_second: float) -> str:
+    """A speed a person can read, or a dash when there is not one yet."""
+    if per_second <= 0:
+        return "-"
+    if per_second < 1024:
+        return f"{per_second:.0f} B/s"
+    return f"{human(int(per_second))}/s"
+
+
+def duration(seconds: float) -> str:
+    """Seconds as 12s, 3m04s or 1h20m. Never a decimal."""
+    total = int(max(seconds, 0))
+    if total < 60:
+        return f"{total}s"
+    if total < 3600:
+        return f"{total // 60}m{total % 60:02d}s"
+    return f"{total // 3600}h{(total % 3600) // 60:02d}m"
+
+
+def format_progress(done: int, total: int, seconds: float, width: int = 28) -> str:
+    """The download line, as a string. Pure, so it can be checked without a tty.
+
+    A total of zero means the server never sent a Content-Length. Then there is
+    no bar and no percentage, because both would be measured against nothing --
+    which is the same reason the archive is asked what it expands to rather
+    than having it guessed.
+    """
+    elapsed = max(seconds, 0.001)
+    rate = done / elapsed
+    if total > 0:
+        frac = min(max(done / total, 0.0), 1.0)
+        filled = int(frac * width)
+        bar = "#" * filled + "-" * (width - filled)
+        head = f"  [{bar}] {frac * 100:5.1f}%  {human(done)}/{human(total)}"
+        eta = f"ETA {duration((total - done) / rate)}" if rate > 0 else "ETA --"
+    else:
+        head = f"  [{'?' * 1}{' ' * (width - 1)}]   ?  {human(done)}"
+        eta = ""
+    return f"{head}  {human_rate(rate):>13}" + (f"  {eta}" if eta else "")
 
 
 def human(count: int) -> str:
@@ -78,16 +148,68 @@ class RangeUnsupported(Exception):
 
 @dataclass
 class Progress:
-    """What a caller can show while a download runs."""
+    """What a caller can show while a download runs.
+
+    `stream` is None for a caller that has somewhere else to show this -- the
+    job, which the web page reads. The CLI passes stdout and gets a live line.
+    The numbers are the same either way: the bar reads this object, it is not a
+    second opinion on it.
+    """
 
     done: int = 0
     total: int = 0
     started: float = field(default_factory=time.time)
+    stream: Any = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _drawn: float = field(default=0.0, repr=False)
+    _painted: int = field(default=0, repr=False)
 
     def advance(self, n: int) -> None:
         with self._lock:
             self.done += n
+            self.draw()
+
+    def draw(self, force: bool = False) -> None:
+        """Repaint the line, unless it was painted a moment ago."""
+        if self.stream is None:
+            return
+        now = time.time()
+        if not force and now - self._drawn < DRAW_INTERVAL:
+            return
+        self._drawn = now
+        line = format_progress(self.done, self.total, now - self.started)
+        self.stream.write("\r" + line)
+        self.stream.flush()
+        self._painted = len(line)
+        global _drawing
+        with _draw_guard:
+            _drawing = self
+
+    def restart(self) -> None:
+        """Zero the clock, for a fetch that starts over on another connection."""
+        with self._lock:
+            self.started = time.time()
+            self.done = 0
+            self._drawn = 0.0
+
+    def finish(self) -> None:
+        """Leave the last state on screen, on a line of its own.
+
+        Without the newline the next thing printed continues the bar, and a
+        finished download reads as a truncated one.
+        """
+        if self.stream is None:
+            return
+        with self._lock:
+            self.draw(force=True)
+            if self._painted:
+                self.stream.write("\n")
+                self.stream.flush()
+                # Now in scrollback rather than on the row a later line would
+                # land on. Left marked painted, the clear_bar below would wipe
+                # the final state of a download that had just succeeded.
+                self._painted = 0
+        clear_bar()
 
     @property
     def seconds(self) -> float:
@@ -294,7 +416,13 @@ def fetch_parallel(url: str, dest: Path, total: int, connections: int = DEFAULT_
     done_spans = list(read_spans(dest))
     todo = missing_spans(dest, total, connections)
     if not todo:
-        return dest.stat().st_size if dest.is_file() else 0
+        # Nothing left to fetch. The bar has counted nothing this run, so it
+        # has to be told the file is whole -- otherwise it closes on 0% after
+        # a resume that had, in fact, just finished the job.
+        size = dest.stat().st_size if dest.is_file() else 0
+        progress.total = total
+        progress.done = size
+        return size
 
     # Sized up front so no thread extends the file past the end while another
     # is still filling in earlier bytes.
@@ -387,6 +515,8 @@ def fetch_single(url: str, dest: Path, expect: int = 0, timeout: int = 60,
                     f"delete the partial and start again"
                 ) from exc
             report("   the server says the file is already complete")
+            if progress is not None:
+                progress.done = have
             return have
         raise SystemExit(f"download failed: HTTP {exc.code} {exc.reason}") from exc
     except (urllib.error.URLError, OSError, TimeoutError) as exc:

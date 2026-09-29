@@ -1451,6 +1451,119 @@ def _web_route_checks(checks) -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _progress_bar_checks(checks) -> None:
+    """The download line, and the fact that it stays out of the way.
+
+    The rate was always computed and thrown away: Progress.rate existed, the
+    web page drew it, and a command-line run printed nothing at all -- while
+    the README promised "a progress line". So the numbers were there and
+    unwatched, which is the same shape as every other bug in this file.
+    """
+    import parallel
+
+    fmt = parallel.format_progress
+    MB = 1024 ** 2
+
+    line = fmt(0, 100 * MB, 0.0)
+    checks.check("bar: an untouched download reads as empty, not as an error",
+                 line.startswith("  [") and "0.0%" in line, line)
+    half = fmt(50 * MB, 100 * MB, 5.0)
+    checks.check("bar: half way reads as half",
+                 "50.0%" in half and "50.00 MiB/100.00 MiB" in half, half)
+    full = fmt(100 * MB, 100 * MB, 10.0)
+    checks.check("bar: a finished download reads as 100%",
+                 "100.0%" in full and "ETA 0s" in full, full)
+    checks.check("bar: the bar itself fills and empties",
+                 half.count("#") == 14 and half.count("-") == 14
+                 and full.count("-") == 0, half)
+
+    # A zero total means no Content-Length. A percentage and a bar would both be
+    # measured against nothing, which is how a bar ends up lying.
+    unknown = fmt(7 * MB, 0, 3.0)
+    checks.check("bar: with no total there is no percentage and no bar",
+                 "%" not in unknown and "#" not in unknown
+                 and "?" in unknown, unknown)
+    checks.check("bar: but the bytes and the rate are still there",
+                 "7.00 MiB" in unknown and "MiB/s" in unknown, unknown)
+
+    # A rate of zero at the first draw is not a division by zero.
+    cold = fmt(0, 100 * MB, 0.0)
+    checks.check("bar: no rate yet reads as a dash, not a crash",
+                 "-" in cold and "ETA" in cold, cold)
+    checks.check("bar: durations are readable at every scale",
+                 [parallel.duration(v) for v in (0, 12, 65, 3600, 5400)]
+                 == ["0s", "12s", "1m05s", "1h00m", "1h30m"],
+                 str([parallel.duration(v) for v in (0, 12, 65, 3600, 5400)]))
+    checks.check("bar: a rate under 1 KB/s is not dressed up as MiB",
+                 parallel.human_rate(0) == "-"
+                 and parallel.human_rate(512) == "512 B/s"
+                 and parallel.human_rate(4.1 * MB).endswith("/s"),
+                 str(parallel.human_rate(4.1 * MB)))
+
+    # Silent when there is no stream, which is the job path: the web page is
+    # already drawing this object and two bars would fight over one row.
+    class Sink:
+        def __init__(self):
+            self.written = []
+
+        def write(self, text):
+            self.written.append(text)
+
+        def flush(self):
+            pass
+
+    quiet = parallel.Progress(total=100)
+    quiet.advance(10)
+    quiet.finish()
+    checks.check("bar: no stream means nothing is written",
+                 quiet._painted == 0, str(quiet._painted))
+
+    sink = Sink()
+    loud = parallel.Progress(total=100 * MB, stream=sink)
+    for _ in range(40):
+        loud.advance(MB)
+    loud.finish()
+    painted = "".join(sink.written)
+    checks.check("bar: a terminal gets a line with the rate on it",
+                 painted.count("\r") >= 1 and "MiB/s" in painted, painted[:120])
+    checks.check("bar: and it ends on a newline so the next line starts clean",
+                 sink.written[-1] == "\n", repr(sink.written[-1]))
+    checks.check("bar: drawing is throttled, not once per chunk",
+                 len(sink.written) < 40, f"{len(sink.written)} writes for 40 chunks")
+
+    # A log line has to be able to wipe the bar, or a warning lands in the
+    # middle of it and both become unreadable.
+    sink2 = Sink()
+    painted_bar = parallel.Progress(total=100 * MB, stream=sink2)
+    painted_bar.done = 50 * MB
+    painted_bar.draw(force=True)
+    before = len(sink2.written)
+    parallel.clear_bar()
+    checks.check("bar: clear_bar wipes the line and leaves the cursor home",
+                 len(sink2.written) > before
+                 and sink2.written[-1].endswith("\r")
+                 and sink2.written[-1].strip("\r ") == "",
+                 repr(sink2.written[-1]))
+
+    # A cancelled download must not leave a bar on screen claiming progress.
+    sink3 = Sink()
+    stopped = parallel.Progress(total=100 * MB, stream=sink3)
+    stopped.done = 10 * MB
+    stopped.draw(force=True)
+    parallel.clear_bar()
+    checks.check("bar: a stop leaves nothing painted",
+                 stopped._painted == 0, str(stopped._painted))
+
+    # restart() is what the single-connection fallback uses after throwing away
+    # the parallel file: the clock and the count both start again.
+    restarted = parallel.Progress(total=100 * MB)
+    restarted.done = 30 * MB
+    restarted.restart()
+    checks.check("bar: a fallback restarts the clock and the count",
+                 restarted.done == 0 and restarted.rate == 0.0,
+                 f"done={restarted.done} rate={restarted.rate}")
+
+
 def main() -> int:
     checks = Checks()
     run(checks)
@@ -1469,6 +1582,7 @@ def main() -> int:
     _job_checks(checks)
     _lock_checks(checks)
     _web_route_checks(checks)
+    _progress_bar_checks(checks)
     total = checks.passed + checks.failed
     print(f"uc-archiver selftest: {checks.passed} passed, {checks.failed} failed")
     return 1 if checks.failed else 0

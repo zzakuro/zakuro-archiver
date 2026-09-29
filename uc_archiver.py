@@ -82,6 +82,9 @@ RAR_LEVEL = {"store": "-m0", "fast": "-m1", "normal": "-m3", "high": "-m4", "max
 
 # --------------------------------------------------------------- small helpers
 def say(msg: str) -> None:
+    # First, because a progress line is sitting on this row while a download
+    # runs, and a log line printed over the top of it makes both unreadable.
+    parallel.clear_bar()
     print(msg, flush=True)
     # Also the active job's log when a job is running, so the console and the
     # web UI read the same lines rather than one translating the other.
@@ -95,6 +98,7 @@ parallel.report = say
 
 
 def warn(msg: str) -> None:
+    parallel.clear_bar()
     print(f"  ! {msg}", flush=True)
     import jobs
     jobs.report(f"  ! {msg}")
@@ -108,6 +112,7 @@ def step(msg: str) -> None:
     jobs.checkpoint()
     line = f"== {msg} =="
     jobs.report(line)
+    parallel.clear_bar()
     print(f"\n{line}", flush=True)
 
 
@@ -596,6 +601,12 @@ def download(url: str, dest: Path, expect: int = 0, timeout: int = 60,
     connections = connections or _default_connections()
     dest.parent.mkdir(parents=True, exist_ok=True)
 
+    # The bar, once, for whichever connection ends up doing the work -- so the
+    # fallback below shows progress rather than going quiet halfway. A caller
+    # that brought its own (a job) keeps it, and it has no stream, because the
+    # web page is already drawing this same object.
+    bar = progress or parallel.Progress(total=0, stream=_cli_stream())
+
     if connections > 1:
         try:
             ranged, total = parallel.probe(url, referer=referer,
@@ -603,7 +614,7 @@ def download(url: str, dest: Path, expect: int = 0, timeout: int = 60,
         except Exception:
             ranged, total = False, 0
         if ranged and total:
-            bar = progress or parallel.Progress(total=total)
+            bar.total = total
             if expect and abs(total - expect) > expect * _SIZE_TOLERANCE:
                 warn(f"the server says {human(total)} and the page said "
                      f"{human(expect)}; going with the server")
@@ -616,16 +627,40 @@ def download(url: str, dest: Path, expect: int = 0, timeout: int = 60,
                 # offsets it wrote are meaningless, so start again on one.
                 warn(f"{exc}; falling back to a single connection")
                 dest.unlink(missing_ok=True)
+                bar.restart()
             except parallel.DownloadCancelled:
+                parallel.clear_bar()
                 raise
             except (OSError, urllib.error.URLError) as exc:
                 warn(f"parallel download failed ({exc}); falling back to one connection")
                 dest.unlink(missing_ok=True)
+                bar.restart()
             else:
+                bar.finish()
                 return got
 
-    return _download_single(url, dest, expect=expect, timeout=timeout,
-                             referer=referer, cancel=cancel, progress=progress)
+    try:
+        got = _download_single(url, dest, expect=expect, timeout=timeout,
+                               referer=referer, cancel=cancel, progress=bar)
+    except BaseException:
+        parallel.clear_bar()
+        raise
+    bar.finish()
+    return got
+
+
+def _cli_stream():
+    """Where a progress line goes, or None when there is no terminal to draw on.
+
+    A redirected or piped run gets nothing rather than a wall of carriage
+    returns, so the log stays readable. The numbers are still on the object --
+    this is only about where they are drawn.
+    """
+    import sys
+    try:
+        return sys.stdout if sys.stdout.isatty() else None
+    except (AttributeError, ValueError):
+        return None
 
 
 def _download_single(url: str, dest: Path, expect: int = 0, timeout: int = 60,
