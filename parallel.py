@@ -596,6 +596,13 @@ def fetch_parallel(url: str, dest: Path, total: int, connections: int = DEFAULT_
                                         start_at=have, tally=tally)
                 have += wrote
                 with lock:
+                    # The partial record for this span goes, or the two ranges
+                    # overlap and every count of what is done reads high. Seen
+                    # on a real fetch: the sidecar reached 100% of the file by
+                    # arithmetic while missing_spans still had a gap, and the
+                    # run announced "resuming at 246.07 MiB of 246.07 MiB".
+                    done_spans[:] = [s for s in done_spans
+                                     if s[0] < span.start or s[1] >= span.end]
                     done_spans.append((span.start, span.end))
                     write_spans(dest, done_spans)
                 return span.length

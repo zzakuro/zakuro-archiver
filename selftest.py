@@ -1781,6 +1781,37 @@ def _span_retry_scenarios(checks, tmp: Path, parallel, Server, threading) -> Non
     finally:
         flaky.close()
 
+    # A span that partly succeeded and then finished used to be recorded twice:
+    # once as the partial run, once as the whole. The two overlap, so every
+    # count of what is done reads high -- the sidecar reached 100% of the file
+    # by arithmetic while missing_spans still had a gap, and a real download
+    # announced "resuming at 246.07 MiB of 246.07 MiB".
+    overlap = tmp / "overlap.bin"
+    parallel.write_spans(overlap, [(0, 149), (0, 199), (400, 499)])
+    counted = sum(b - a + 1 for a, b in parallel.read_spans(overlap))
+    checks.check("retry: an overlapping sidecar is counted as overlapping, "
+                 "which is what makes the double-record worth fixing",
+                 counted == 450, f"{counted} bytes counted for a {total} file")
+    # And through the real path: a file with a partial span recorded is
+    # finished by a real fetch, and each range is named once afterwards.
+    server = Server(payload=b"z" * total)
+    try:
+        d = tmp / "resumed-mid-span.bin"
+        with open(d, "wb") as fh:
+            fh.truncate(total)
+            fh.write(b"z" * 200)       # the sidecar is the record of truth, so
+                                        # the bytes it claims have to be there
+        parallel.write_spans(d, [(0, 199)])
+        got = parallel.fetch_parallel(server.url, d, total, connections=1,
+                                      timeout=20)
+        checks.check("retry: a fetch resuming over a partial span finishes it",
+                     got == total and d.read_bytes() == b"z" * total,
+                     f"{got} of {total}")
+        checks.check("retry: and leaves no sidecar claiming a finished file",
+                     not parallel.spans_file(d).exists())
+    finally:
+        server.close()
+
     # -- a span that never gets a byte eventually gives up ---------------
     # Ten consecutive silent failures is a host that is not serving this slice.
     # It has to fail rather than wait for ever.
