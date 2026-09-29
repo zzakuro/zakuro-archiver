@@ -38,7 +38,8 @@ WORKDIR /app
 # testserver.py go with it: the first is the downloader, the second is what
 # the self test serves files from, and a container that cannot run its own
 # tests is a container nobody can trust.
-COPY uc_archiver.py parallel.py selftest.py testserver.py ./
+COPY uc_archiver.py parallel.py jobs.py webapp.py selftest.py testserver.py ./
+COPY static/ ./static/
 COPY profiles/ ./profiles/
 
 # scrapling pulls curl_cffi and the parser; the [all] extra brings the browser
@@ -65,9 +66,20 @@ ENV PYTHONUNBUFFERED=1 \
 
 # Reports whether the browser this needs is actually usable, which is the one
 # thing that silently fails otherwise.
+# Reports whether the browser this depends on is actually usable, which is the
+# one thing that fails silently otherwise.
 HEALTHCHECK --interval=1m --timeout=20s --retries=2 \
   CMD python -c "import sys, uc_archiver as u; sys.exit(1 if u.scrapling_problem() else 0)" \
    || exit 1
 
+# Loopback only, and the page is reachable on the published port. Binding to
+# every interface from inside a container would put an unauthenticated way to
+# start downloads on the host's network, so the port is published instead and
+# UC_HOST stays loopback.
+ENV UC_HOST=127.0.0.1
+EXPOSE 8073
+
 ENTRYPOINT ["python", "/app/uc_archiver.py"]
-CMD ["--help"]
+# No arguments: --serve is the default, so a bare `docker run` gives the web
+# interface rather than a help message. Pass a catalogue to do anything.
+CMD ["--serve"]

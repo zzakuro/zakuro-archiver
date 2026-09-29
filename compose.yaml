@@ -1,0 +1,62 @@
+# uc-archiver, with Surge alongside it.
+#
+#   docker compose up -d
+#   docker compose exec surge surge token        # the token for the web page
+#   open http://127.0.0.1:8073
+#
+# Two containers because there are two programs. uc-archiver is the pipeline;
+# Surge is a download manager that fetches several chunks at once, which the
+# share host allows and which one connection does not.
+
+services:
+  uc-archiver:
+    build: .
+    # The catalogue to work from. Mount your own, or drop one in the image.
+    volumes:
+      - ./catalogue.json:/work/catalogue.json:ro
+      - ./out:/work/out
+      # Downloads and unpacked folders are big and throwaway; keep them off the
+      # writable layer so they can be a different volume or a tmpfs.
+      - work:/work/tmp
+    environment:
+      # Inside the container the page has to bind 0.0.0.0 to be reachable, but
+      # it is only *published* on the host's loopback below. That keeps an
+      # unauthenticated way to start downloads off the network.
+      UC_HOST: "0.0.0.0"
+      UC_TOKEN: "${UC_TOKEN:?set UC_TOKEN in .env, or the page has no auth}"
+      UC_CONNECTIONS: "4"
+      # Hand downloads to the sidecar instead of fetching them here.
+      SURGE_HOST: "surge:1700"
+      SURGE_TOKEN: "${SURGE_TOKEN:-}"
+      # rar is proprietary and not in the image. 7-Zip reads the .7z shares and
+      # writes .7z output; mount a rar and point --archiver at it for .rar.
+    command: ["--serve", "--port", "8073", "--work-dir", "/work/tmp",
+              "--output-dir", "/work/out", "/work/catalogue.json"]
+    ports:
+      # 127.0.0.1 on the host, not 0.0.0.0. Change this only if you have put a
+      # token in front of it and know what that means.
+      - "127.0.0.1:8073:8073"
+    restart: unless-stopped
+    depends_on:
+      - surge
+
+  surge:
+    # Their own image, their own server mode. Not the scrapling one -- different
+    # project, and scrapling's does not contain Surge.
+    image: ghcr.io/surgedm/surge
+    # A shared volume for finished files, so uc-archiver can pick them up
+    # without either side copying them across the network.
+    volumes:
+      - downloads:/downloads
+      - surge-config:/var/lib/surge
+    # Not published. uc-archiver reaches it over the compose network and nothing
+    # else needs to: its API can start downloads for anything that can reach
+    # it, which is exactly why it does not get a host port.
+    expose:
+      - "1700"
+    restart: unless-stopped
+
+volumes:
+  work:
+  downloads:
+  surge-config:

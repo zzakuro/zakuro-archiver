@@ -1137,7 +1137,7 @@ def build_parser() -> argparse.ArgumentParser:
     g = p.add_argument_group("web interface")
     g.add_argument("--serve", action="store_true",
                    help="run the web interface instead of a one-off job")
-    g.add_argument("--host", default="127.0.0.1",
+    g.add_argument("--host", default=os.environ.get("UC_HOST", "127.0.0.1"),
                    help="address for --serve (default: loopback only; anything "
                         "else needs UC_TOKEN set)")
     g.add_argument("--port", type=int, default=8073, help="port for --serve")

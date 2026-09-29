@@ -61,6 +61,74 @@ describes the archive and the catalogue carries a build id:
 host. Only the last path component is ever read, so a host answering with a
 full path cannot steer the name out of the output directory.
 
+## The web interface
+
+```bash
+python uc_archiver.py catalogue.json --serve
+```
+
+A page for picking an entry, starting it, watching it and stopping it, on top
+of the command line that is still there. Standard library only, so the container
+gains no dependency.
+
+The pipeline is not rebuilt for this — it is listened to. Every phase already
+announces itself with `step()` and narrates with `say()`, and the downloader
+already reports bytes, so a job is those three collected. The console and the
+browser read the same model, and a run is `main()` with synthesised arguments,
+so there is one pipeline rather than two that drift apart.
+
+`step()` is also where a stop is honoured. Every phase begins with one, so that
+is the single place the check lives. A cancelled download stops between chunks,
+not between files.
+
+Progress goes over SSE where the browser supports it, and every route also
+answers plain JSON, so a script can drive it without a browser:
+
+| Route | Does |
+| --- | --- |
+| `GET /api/status` | what is configured, whether scrapling works, connections |
+| `GET /api/catalogue` | the entries, for the picker |
+| `POST /api/jobs` | start one: `{"index": 242, "options": {"force": true}}` |
+| `GET /api/jobs` | every job with its state |
+| `GET /api/jobs/{id}` | one job in full |
+| `GET /api/jobs/{id}/events` | SSE, for the live bar |
+| `POST /api/jobs/{id}/cancel` | stop it |
+| `POST /api/jobs/clear` | forget finished ones |
+
+**It binds loopback by default and says so when there is no token.** Starting
+downloads and writing archives to disk is not something to put on a network by
+accident. `UC_TOKEN` turns on bearer auth, and the page asks for it once and
+remembers it for the session.
+
+## In Docker
+
+```bash
+echo "UC_TOKEN=$(openssl rand -hex 16)" > .env
+docker compose up -d
+docker compose exec surge surge token      # for the Surge side, if it needs one
+open http://127.0.0.1:8073
+```
+
+`compose.yaml` runs two containers, because there are two programs:
+
+- **uc-archiver** — the pipeline and the page, published on `127.0.0.1:8073`
+  only. It binds `0.0.0.0` inside the container because that is the only way
+  to be reachable at all, and is published on loopback so an unauthenticated
+  way to start downloads never reaches the network.
+- **surge** — `ghcr.io/surgedm/surge` in server mode, **not** given a host
+  port. Its API can start downloads for anything that reaches it, and the only
+  thing that needs to is uc-archiver, over the compose network.
+
+Set `UC_CONNECTIONS` for the built-in downloader (4 by default, 1 reverts to a
+single connection) and `SURGE_HOST` / `SURGE_TOKEN` to hand downloads to the
+sidecar instead.
+
+Two things the image does not have, both explained where they are missed:
+**rar** is proprietary and not redistributable, so 7-Zip is there instead and
+you get `.7z` output; mount a `rar` and point `--archiver` at it for `.rar`. And
+the browser is scrapling's own, fetched at build time, which is the browser
+that clears the challenge.
+
 ## The folder inside
 
 Renaming the archive was only half of it. These archives wrap the game in a
