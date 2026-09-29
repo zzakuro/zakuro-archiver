@@ -508,6 +508,21 @@ def _resolver_checks(checks) -> None:
     checks.check("share: a moved id falls back to the title",
                  s2.name == "Some Game", s2.name)
 
+    # A relative href is resolved against the page it came from rather than a
+    # domain written into the code. The host has moved once already and both
+    # spellings answer today, so a hardcoded one costs nothing now and is a
+    # silent wrong-host link the day it does.
+    for page_url in ("https://vikingfile.com/f/2Yrfl4o0bE",
+                     "https://vik1ngfile.site/f/7xQAYwCHIL"):
+        origin = page_url.split("/f/")[0]
+        got = uc._share_from(FakePage("g.7z", "1 MB", "/d/abc/g.7z"), page_url)
+        checks.check(f"share: a relative link follows the page it came from "
+                     f"({origin.split('//')[1]})",
+                     got.download_url == f"{origin}/d/abc/g.7z",
+                     got.download_url)
+        checks.check("share: and the page url is kept for the Referer",
+                     got.page_url == page_url, got.page_url)
+
     try:
         resolve_with(FakePage("n", "1 MB", ""))
         checks.check("share: no link is a clear error, not a bad download",

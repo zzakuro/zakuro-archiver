@@ -464,7 +464,12 @@ def _share_from(page, page_url: str) -> Share:
             "run with --headed to watch it happen."
         )
     if href.startswith("/"):
-        href = "https://vikingfile.com" + href
+        # Against the page's own origin, not a domain written down here. The
+        # host has already moved once (vikingfile.com -> vik1ngfile.site) and
+        # both answer today, so a hardcoded one costs nothing today and is a
+        # silent wrong-host link the day it does. urljoin against the URL we
+        # actually loaded is right wherever the site lives.
+        href = urllib.parse.urljoin(page_url, href)
     return Share(
         page_url=page_url,
         name=name or "download.bin",

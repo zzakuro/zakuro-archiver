@@ -65,8 +65,6 @@ ENV PYTHONUNBUFFERED=1 \
     SURGE_HOST= \
     SURGE_TOKEN=
 
-# Reports whether the browser this needs is actually usable, which is the one
-# thing that silently fails otherwise.
 # Reports whether the browser this depends on is actually usable, which is the
 # one thing that fails silently otherwise.
 HEALTHCHECK --interval=1m --timeout=20s --retries=2 \

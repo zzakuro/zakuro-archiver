@@ -358,11 +358,13 @@ writable layer.
 python selftest.py
 ```
 
-163 checks, none of which touch the network or need an archiver. The store is
+288 checks, none of which touch the network or need an archiver. The store is
 faked at the urlopen boundary, the share page at the session boundary, and the
 download at the same, so the parsing is tested — including the case where the
 page gives no link, which has to be a clear error rather than a silently wrong
-download.
+download. The throttling server is local too, and can be told to answer 429 for
+a given range or to come back short, so a rate-limited download is reproducible
+rather than assumed.
 
 Three of them exist because the bug they cover was invisible otherwise:
 
