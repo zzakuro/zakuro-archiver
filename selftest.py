@@ -1238,6 +1238,219 @@ def _job_checks(checks) -> None:
                   dead.fraction < 0.99)[1], str(dead.fraction))
 
 
+def _lock_checks(checks) -> None:
+    """Two runs of one entry must not both start.
+
+    They deadlock, and the symptom is a hang with no error message: both open
+    the same partial for writing, neither gets a byte out, and it reads as a
+    slow network. It happened twice here before this existed, and both times
+    the diagnosis was "did I start it twice".
+    """
+    import shutil as _shutil
+    from pathlib import Path as _Path
+
+    work = _Path(tempfile.mkdtemp(prefix="uc-lock-"))
+    try:
+        target = work / "game.7z"
+        target.write_bytes(b"partial")
+
+        with uc._RunLock(target, "game.7z"):
+            lock = uc._lock_path(target)
+            checks.check("lock: it exists while held", lock.exists())
+            checks.check("lock: it records who holds it",
+                         lock.read_text(encoding="ascii").strip().isdigit())
+            try:
+                with uc._RunLock(target, "game.7z"):
+                    checks.check("lock: a second run is refused", False,
+                                 "it was allowed in")
+            except uc.AlreadyRunning as exc:
+                checks.check("lock: a second run is refused", True)
+                checks.check("lock: and the refusal says who to stop",
+                             "pid" in str(exc), str(exc))
+        checks.check("lock: released on the way out",
+                     not uc._lock_path(target).exists())
+
+        # A lock left behind by a run that died must not block the next one.
+        stale = work / "other.7z"
+        stale.write_bytes(b"x")
+        uc._lock_path(stale).write_text("999999999", encoding="ascii")
+        try:
+            with uc._RunLock(stale, "other.7z"):
+                checks.check("lock: a stale lock from a dead run is cleared", True)
+        except uc.AlreadyRunning as exc:
+            checks.check("lock: a stale lock from a dead run is cleared", False,
+                         str(exc))
+        checks.check("lock: and it is gone again afterwards",
+                     not uc._lock_path(stale).exists())
+    finally:
+        _shutil.rmtree(work, ignore_errors=True)
+
+
+def _web_route_checks(checks) -> None:
+    """Every JSON route, walked and parsed.
+
+    The catalogue route shipped broken -- it called a `to_dict` that `Entry`
+    does not have, and the page showed "cannot load the catalogue" -- because
+    /api/status and the job routes had all been verified by hand against a
+    running server while that one was not. So this walks all of them in one
+    place, offline, and parses every answer.
+
+    A real socket on an ephemeral port rather than calling the handler
+    directly. The claim being tested is that a route answers with JSON, and the
+    routing, the auth check and the body are all part of that claim.
+
+    No route here starts a download. A run is submitted straight to the job
+    manager with a function that returns a string, because POST /api/jobs
+    calls main() for real.
+    """
+    import threading
+    import urllib.error
+    import urllib.request
+    from http.server import ThreadingHTTPServer
+
+    import jobs
+    import webapp
+
+    tmp = Path(tempfile.mkdtemp(prefix="uc-webtest-"))
+    cat_path = tmp / "routes.json"
+    cat_path.write_text(json.dumps(CATALOGUE), encoding="utf-8")
+
+    webapp.Handler.app = webapp.Server(catalogue=str(cat_path))
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), webapp.Handler)
+    httpd.daemon_threads = True
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+    def call(path, method="GET", body=None, token=""):
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        req = urllib.request.Request(base + path, data=data, method=method)
+        req.add_header("Content-Type", "application/json")
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, r.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode("utf-8")
+        except (TimeoutError, OSError) as exc:
+            # A route that hangs must read as a failed check, not take the
+            # whole run down with it: a traceback here would abort the suite
+            # and hide every check after this one.
+            return 0, f"no answer: {type(exc).__name__}: {exc}"
+
+    def as_json(text):
+        try:
+            return json.loads(text)
+        except ValueError:
+            return None
+
+    try:
+        # -- the route that shipped broken ----------------------------
+        status, text = call("/api/catalogue")
+        checks.check("web: the catalogue route answers 200",
+                     status == 200, f"{status} {text[:100]}")
+        cat = as_json(text)
+        checks.check("web: the catalogue route answers JSON, not an error",
+                     isinstance(cat, dict) and "error" not in cat, text[:100])
+        if isinstance(cat, dict):
+            # Two of the five rows carry no link and are dropped on load, so
+            # the count is of entries, not of rows in the file.
+            checks.check("web: it counts the entries it carries",
+                         cat.get("count") == len(cat.get("entries") or []) == 3,
+                         str(cat.get("count")))
+            checks.check("web: it carries the catalogue's name",
+                         cat.get("name") == CATALOGUE["name"], str(cat.get("name")))
+            first = (cat.get("entries") or [{}])[0]
+            want = {"index", "title", "url", "hash", "declared_size",
+                    "declared_size_text", "uploaded"}
+            checks.check("web: an entry has every field the page reads",
+                         want <= set(first), str(sorted(set(first))))
+            checks.check("web: the fields are the entry's own, not shifted",
+                         first.get("index") == 1
+                         and first.get("title") == CATALOGUE["downloads"][0]["title"]
+                         and first.get("hash") == "aaaaaaaaaaaa"
+                         and first.get("url", "").endswith("aaaaaaaaaaaa"),
+                         str(first)[:160])
+            checks.check("web: declared_size is read from the text, not invented",
+                         first.get("declared_size") == uc.parse_page_size("11.1 GB")
+                         and first.get("declared_size_text") == "11.1 GB",
+                         str(first.get("declared_size")))
+            checks.check("web: every entry is complete, not just the first",
+                         all(want <= set(e) for e in cat.get("entries") or []))
+
+        # -- the rest of the API --------------------------------------
+        status, text = call("/api/status")
+        body = as_json(text)
+        checks.check("web: /api/status answers 200 with a dict",
+                     status == 200 and isinstance(body, dict), f"{status} {text[:80]}")
+        checks.check("web: /api/status says which catalogue is loaded",
+                     isinstance(body, dict) and body.get("catalogue") == str(cat_path),
+                     str(body)[:100] if isinstance(body, dict) else text[:80])
+
+        # A finished job, so /events has a terminal state to send and end on
+        # rather than looping for ever.
+        probe = webapp.Handler.app.jobs.submit(1, "probe", lambda job: "ok")
+        for _ in range(100):
+            if probe.state in (jobs.DONE, jobs.FAILED):
+                break
+            time.sleep(0.05)
+        checks.check("web: the probe job finished",
+                     probe.state == jobs.DONE, f"{probe.state} {probe.error}")
+
+        status, text = call("/api/jobs")
+        body = as_json(text)
+        checks.check("web: /api/jobs answers 200 with a list",
+                     status == 200 and isinstance(body, list) and body, f"{status}")
+
+        status, text = call(f"/api/jobs/{probe.id}")
+        body = as_json(text)
+        checks.check("web: one job comes back whole",
+                     status == 200 and isinstance(body, dict)
+                     and body.get("id") == probe.id, f"{status} {text[:80]}")
+
+        status, text = call(f"/api/jobs/{probe.id}/events")
+        checks.check("web: the event stream opens and sends a state",
+                     status == 200 and text.startswith("data: ")
+                     and as_json(text[6:].split("\n", 1)[0]) is not None,
+                     f"{status} {text[:80]}")
+
+        status, text = call(f"/api/jobs/{probe.id}/cancel", method="POST")
+        checks.check("web: cancelling a finished job is refused with 409",
+                     status == 409 and as_json(text) == {"cancelled": False},
+                     f"{status} {text[:80]}")
+
+        status, text = call("/api/jobs/clear", method="POST")
+        checks.check("web: clear answers with what it removed",
+                     status == 200 and isinstance(as_json(text), dict)
+                     and "cleared" in as_json(text), f"{status} {text[:80]}")
+
+        for path in ("/api/jobs/nope", "/api/nowhere"):
+            status, text = call(path)
+            body = as_json(text)
+            checks.check(f"web: {path} is a 404 with a reason, not a crash",
+                         status == 404 and isinstance(body, dict)
+                         and "error" in body, f"{status} {text[:80]}")
+
+        # -- the token -------------------------------------------------
+        # Handler.app is read per request, so swapping it turns auth on
+        # without a second server.
+        webapp.Handler.app = webapp.Server(token="s3cret", catalogue=str(cat_path))
+        status, _ = call("/api/status")
+        checks.check("web: with a token set, a bare request is refused",
+                     status == 401, str(status))
+        status, _ = call("/api/status", token="wrong")
+        checks.check("web: the wrong token is refused too", status == 401, str(status))
+        status, _ = call("/api/status", token="s3cret")
+        checks.check("web: the right token is let in", status == 200, str(status))
+        status, _ = call("/api/catalogue", token="s3cret")
+        checks.check("web: and the catalogue answers behind it too",
+                     status == 200, str(status))
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main() -> int:
     checks = Checks()
     run(checks)
@@ -1254,6 +1467,8 @@ def main() -> int:
     _inner_folder_checks(checks)
     _parallel_download_checks(checks)
     _job_checks(checks)
+    _lock_checks(checks)
+    _web_route_checks(checks)
     total = checks.passed + checks.failed
     print(f"uc-archiver selftest: {checks.passed} passed, {checks.failed} failed")
     return 1 if checks.failed else 0

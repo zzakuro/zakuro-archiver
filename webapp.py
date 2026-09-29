@@ -227,15 +227,40 @@ class Handler(BaseHTTPRequestHandler):
         }
 
     def _catalogue(self):
+        """The entries, or a reason there are none.
+
+        The whole body is inside the try on purpose. Anything that escapes a
+        request handler does not produce an error page -- the connection is
+        closed and the browser reports a network failure, which is why "cannot
+        load the catalogue" says nothing about what went wrong. A handler that
+        always answers something is worth a great deal more than one that is
+        usually right.
+        """
         try:
             cat = self.app.load()
+            return {
+                "name": cat.name,
+                "count": len(cat.entries),
+                # Built here rather than by a method on Entry. Entry is the
+                # tool's own model and the CLI prints it through
+                # print_catalogue, not through a dict -- so a to_dict would be
+                # a second, web-only view of the same row, and the one route
+                # that had it was the one that shipped broken.
+                "entries": [
+                    {
+                        "index": e.index,
+                        "title": e.title,
+                        "url": e.uri,
+                        "hash": e.hash,
+                        "declared_size": uc.parse_page_size(e.file_size),
+                        "declared_size_text": e.file_size,
+                        "uploaded": e.upload_date,
+                    }
+                    for e in cat.entries
+                ],
+            }
         except (Exception, SystemExit) as exc:            # noqa: BLE001
-            return {"error": str(exc) or f"{type(exc).__name__}"}
-        return {
-            "name": cat.name,
-            "count": len(cat),
-            "entries": [e.to_dict() for e in cat.entries],
-        }
+            return {"error": str(exc) or type(exc).__name__}
 
     def _job(self, job_id: str):
         job = self.app.jobs.get(job_id)
@@ -266,6 +291,17 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                     last = state
                 if state["state"] in (jobs.DONE, jobs.FAILED, jobs.CANCELLED):
+                    # Ending the stream has to end the socket with it. The
+                    # Connection header above says keep-alive but is only
+                    # advisory: close_connection is set from the *request*, and
+                    # an HTTP/1.1 request without "Connection: close" leaves it
+                    # False. So returning here used to leave the socket open
+                    # with the client still waiting for the stream to finish.
+                    # A browser's EventSource does not notice -- it reconnects
+                    # on its own -- but any script reading to the end hangs
+                    # until it times out, which is the client the plain JSON
+                    # routes are for.
+                    self.close_connection = True
                     return
                 time.sleep(0.4)
         except (BrokenPipeError, ConnectionResetError, OSError):

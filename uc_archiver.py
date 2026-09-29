@@ -490,6 +490,88 @@ def parse_page_size(text: str) -> int:
         return 0
 
 
+# ------------------------------------------------------------------- locking
+#
+# Two runs of the same entry will deadlock, and the symptom is a hang with no
+# error: both open the same partial for writing, neither gets a byte out, and
+# it looks like a slow network rather than a contradiction. It happened twice
+# here before this existed, and both times the fix was "did I start it twice".
+#
+# The job manager knows about jobs within one process, so the web interface
+# cannot hit this. Two command lines in two terminals can, and the tool has no
+# way to ask the other one.
+
+def _lock_path(download_path: Path) -> Path:
+    return download_path.with_name(download_path.name + ".lock")
+
+
+class AlreadyRunning(RuntimeError):
+    """Another process is already fetching this file."""
+
+
+class _RunLock:
+    """An exclusive claim on one download, released however the run ends.
+
+    Holds the lock file open for its lifetime. On Windows an open handle with
+    no sharing is refused by a second process, which is the whole mechanism --
+    there is no window in which both believe they hold it. On a filesystem
+    that ignores the exclusivity (some network mounts) it degrades to a plain
+    file, which is still better than nothing because the contents record the
+    pid and the check below catches a stale one.
+    """
+
+    def __init__(self, download_path: Path, what: str) -> None:
+        self.path = _lock_path(download_path)
+        self.what = what
+        self._fd = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self._fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            owner = self._owner()
+            if owner is None:
+                # Nobody holds it. A previous run died without cleaning up.
+                self.path.unlink(missing_ok=True)
+                return self.__enter__()
+            raise AlreadyRunning(
+                f"another run is already fetching {self.what} "
+                f"(pid {owner}). Stop it first, or delete {self.path.name} "
+                f"if you are sure nothing is running."
+            ) from None
+        os.write(self._fd, str(os.getpid()).encode("ascii"))
+        return self
+
+    def __exit__(self, *_exc):
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+        self.path.unlink(missing_ok=True)
+        return False
+
+    def _owner(self):
+        try:
+            pid = int(self.path.read_text(encoding="ascii").strip() or 0)
+        except (OSError, ValueError):
+            return None
+        if not pid:
+            return None
+        # A pid that is not running cannot be holding the file.
+        if sys.platform == "win32":
+            import ctypes
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return None
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return pid
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return None
+        return pid
+
+
 # ------------------------------------------------------------------ download
 def download(url: str, dest: Path, expect: int = 0, timeout: int = 60,
              referer: str = "", connections: int = 0, cancel=None,
@@ -1426,13 +1508,21 @@ def main(argv: list[str] | None = None) -> int:
     # With a job running the download reports into it and takes its stop flag.
     # On the plain command line there is no job, so it is None and the
     # downloader behaves exactly as it always has.
-    import jobs
-    job = jobs.current()
-    got = download(share.download_url, download_path, expect=need,
-                   timeout=args.timeout, referer=share.page_url,
-                   progress=jobs.bind_progress(job) if job else None,
-                   cancel=job.stop_requested if job else None)
-    say(f"   {human(got)} in {download_path.name}")
+        import jobs
+        job = jobs.current()
+        # Held for the whole run, not just the fetch: two runs of one entry
+        # deadlock on the shared partial, and a hang with no error is a bad
+        # thing to hand someone.
+        try:
+            with _RunLock(download_path, safe_remote):
+                got = download(share.download_url, download_path, expect=need,
+                               timeout=args.timeout, referer=share.page_url,
+                               progress=jobs.bind_progress(job) if job else None,
+                               cancel=job.stop_requested if job else None)
+        except AlreadyRunning as exc:
+            raise SystemExit(str(exc))
+        say(f"   {human(got)} in {download_path.name}")
+
     if Path(safe_remote).stem.lower() != Path(download_path).stem.lower() and "." in safe_remote:
         say(f"   the host calls it {safe_remote}")
 
