@@ -1,12 +1,16 @@
-# uc-archiver, with Surge alongside it.
+# uc-archiver.
 #
 #   docker compose up -d
-#   docker compose exec surge surge token        # the token for the web page
 #   open http://127.0.0.1:8073
 #
-# Two containers because there are two programs. uc-archiver is the pipeline;
-# Surge is a download manager that fetches several chunks at once, which the
-# share host allows and which one connection does not.
+# One container, because there is one program. It used to run a Surge sidecar
+# beside it, declared through SURGE_HOST and SURGE_TOKEN, and nothing ever read
+# them: a download manager that was never wired to anything, described in the
+# Dockerfile as though it were. The measurements said it was not wanted either --
+# aria2, a mature independent implementation, matched the built-in downloader to
+# within noise on the same file and the same machine, and the limiter that
+# matters is per share and per IP rather than per client. So the built-in
+# downloader stands on its own, and the container gains no dependency for it.
 
 services:
   uc-archiver:
@@ -24,10 +28,11 @@ services:
       # unauthenticated way to start downloads off the network.
       UC_HOST: "0.0.0.0"
       UC_TOKEN: "${UC_TOKEN:?set UC_TOKEN in .env, or the page has no auth}"
+      # What a single download would like, and what the process may have at
+      # once across every job. The second is the one that matters when several
+      # run together, because the host's limit is per IP.
       UC_CONNECTIONS: "8"
-      # Hand downloads to the sidecar instead of fetching them here.
-      SURGE_HOST: "surge:1700"
-      SURGE_TOKEN: "${SURGE_TOKEN:-}"
+      UC_TOTAL_CONNECTIONS: "8"
       # rar is proprietary and not in the image. 7-Zip reads the .7z shares and
       # writes .7z output; mount a rar and point --archiver at it for .rar.
     command: ["--serve", "--port", "8073", "--work-dir", "/work/tmp",
@@ -37,26 +42,6 @@ services:
       # token in front of it and know what that means.
       - "127.0.0.1:8073:8073"
     restart: unless-stopped
-    depends_on:
-      - surge
-
-  surge:
-    # Their own image, their own server mode. Not the scrapling one -- different
-    # project, and scrapling's does not contain Surge.
-    image: ghcr.io/surgedm/surge
-    # A shared volume for finished files, so uc-archiver can pick them up
-    # without either side copying them across the network.
-    volumes:
-      - downloads:/downloads
-      - surge-config:/var/lib/surge
-    # Not published. uc-archiver reaches it over the compose network and nothing
-    # else needs to: its API can start downloads for anything that can reach
-    # it, which is exactly why it does not get a host port.
-    expose:
-      - "1700"
-    restart: unless-stopped
 
 volumes:
   work:
-  downloads:
-  surge-config:

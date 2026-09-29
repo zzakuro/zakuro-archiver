@@ -136,7 +136,10 @@ async function loadStatus() {
     const s = await api("/api/status");
     const bits = [];
     if (s.connections) bits.push(s.connections + " connections");
-    if (s.surge_host) bits.push("surge: " + s.surge_host);
+    // The shared budget as well, because with several jobs running the number
+    // that governs is the second one: each wants the first, and the host's
+    // limit is per IP rather than per download.
+    if (s.budget && s.budget[1]) bits.push(s.budget[0] + "/" + s.budget[1] + " in use");
     if (s.scrapling) bits.push("browser: " + s.scrapling);
     $("#status").textContent = bits.length ? bits.join(" · ") : "ready";
   } catch (e) { $("#status").textContent = "cannot reach the server"; }

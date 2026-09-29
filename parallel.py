@@ -407,6 +407,52 @@ def _covered(dest: Path) -> int:
     return sum(b - a + 1 for a, b in read_spans(dest))
 
 
+# One budget for the whole process, not one per download.
+#
+# The throttle that matters is per IP, so N downloads each taking eight
+# connections is N times eight sockets against a single limit that eight was
+# already the wrong side of once. UC_CONNECTIONS is now how many a single
+# download would like; this is how many it may actually have at once, shared
+# out between whatever is running. Run one thing and it is the same as before.
+#
+# Counted rather than capped with a semaphore, because a download that is
+# waiting for a slot should not be holding a worker thread while it waits --
+# and because the number is readable from /api/status without disturbing a
+# download in progress.
+_budget_lock = threading.Lock()
+_in_flight = 0
+_budget_total = DEFAULT_CONNECTIONS
+
+
+def set_budget(total: int) -> None:
+    """Set how many connections this process may use at once."""
+    global _budget_total
+    with _budget_lock:
+        _budget_total = max(1, int(total))
+
+
+def budget() -> tuple[int, int]:
+    """(in use, allowed). Read by the status route."""
+    with _budget_lock:
+        return _in_flight, _budget_total
+
+
+def _acquire_slot() -> None:
+    global _in_flight
+    while True:
+        with _budget_lock:
+            if _in_flight < _budget_total:
+                _in_flight += 1
+                return
+        time.sleep(0.1)
+
+
+def _release_slot() -> None:
+    global _in_flight
+    with _budget_lock:
+        _in_flight = max(0, _in_flight - 1)
+
+
 def compact_prefix(dest: Path) -> int:
     """Keep the valid run from byte 0, drop the rest, and say how much that was.
 
@@ -618,49 +664,60 @@ def fetch_parallel(url: str, dest: Path, total: int, connections: int = DEFAULT_
         while True:
             if stop.is_set():
                 raise DownloadCancelled()
-            tally: list[int] = [0]
+            # Held for the life of the span, not for one attempt, so a
+            # retrying span keeps its share of the budget instead of
+            # re-queuing behind the others each time it backs off.
+            _acquire_slot()
             try:
-                with open(dest, "r+b") as handle:   # this thread's own handle
-                    wrote = _fetch_span(url, dest, span, referer, timeout,
-                                        progress, share_cancel, handle,
-                                        start_at=have, tally=tally)
-                have += wrote
-                with lock:
-                    # The partial record for this span goes, or the two ranges
-                    # overlap and every count of what is done reads high. Seen
-                    # on a real fetch: the sidecar reached 100% of the file by
-                    # arithmetic while missing_spans still had a gap, and the
-                    # run announced "resuming at 246.07 MiB of 246.07 MiB".
-                    done_spans[:] = [s for s in done_spans
-                                     if s[0] < span.start or s[1] >= span.end]
-                    done_spans.append((span.start, span.end))
-                    write_spans(dest, done_spans)
-                return span.length
-            except DownloadCancelled:
-                raise
-            except RangeUnsupported:
-                # Not a throttle: the host ignored the Range, so the whole
-                # parallel premise is void and the caller has to know that.
-                raise
-            except (OSError, urllib.error.URLError) as exc:
-                have += tally[0]
-                if tally[0]:
-                    tries = 0        # it moved, so this is not a failure yet
+                tally: list[int] = [0]
+                try:
+                    with open(dest, "r+b") as handle:  # this thread's own
+                        wrote = _fetch_span(url, dest, span, referer, timeout,
+                                            progress, share_cancel, handle,
+                                            start_at=have, tally=tally)
+                    have += wrote
                     with lock:
-                        if have < span.length:
-                            done_spans.append((span.start, span.start + have - 1))
-                            write_spans(dest, done_spans)
-                else:
-                    tries += 1
-                if tries > SPAN_MAX_TRIES:
-                    report(f"   {span.header} is still being throttled after "
-                           f"{SPAN_MAX_TRIES} tries; leaving it for another pass")
-                    dead.release()
-                    return 0
-                report(f"   {span.header} interrupted ({exc}); "
-                       f"retry {tries} of {SPAN_MAX_TRIES} at byte "
-                       f"{span.start + have} in {retry_delay(tries):.0f}s")
-                _sleep_or_cancel(retry_delay(tries), stop, cancel)
+                        # The partial record goes, or the two ranges overlap
+                        # and every count of what is done reads high. Seen on a
+                        # real fetch: the sidecar reached 100% of the file by
+                        # arithmetic while missing_spans still had a gap, and
+                        # the run announced "resuming at 246.07 of 246.07 MiB".
+                        done_spans[:] = [s for s in done_spans
+                                         if s[0] < span.start or s[1] >= span.end]
+                        done_spans.append((span.start, span.end))
+                        write_spans(dest, done_spans)
+                    return span.length
+                except DownloadCancelled:
+                    raise
+                except RangeUnsupported:
+                    # Not a throttle: the host ignored the Range, so the whole
+                    # parallel premise is void and the caller has to know that.
+                    raise
+                except (OSError, urllib.error.URLError) as exc:
+                    have += tally[0]
+                    if tally[0]:
+                        tries = 0    # it moved, so this is not a failure yet
+                        with lock:
+                            if have < span.length:
+                                done_spans.append(
+                                    (span.start, span.start + have - 1))
+                                write_spans(dest, done_spans)
+                    else:
+                        tries += 1
+                    if tries > SPAN_MAX_TRIES:
+                        report(f"   {span.header} is still being throttled "
+                               f"after {SPAN_MAX_TRIES} tries; leaving it for "
+                               f"another pass")
+                        dead.release()
+                        return 0
+                    report(f"   {span.header} interrupted ({exc}); "
+                           f"retry {tries} of {SPAN_MAX_TRIES} at byte "
+                           f"{span.start + have} in {retry_delay(tries):.0f}s")
+                    _sleep_or_cancel(retry_delay(tries), stop, cancel)
+            finally:
+                # Given back whatever happened, including a stop: a slot left
+                # held would shrink the budget for every other download.
+                _release_slot()
 
     for attempt in range(1, PARALLEL_PASSES + 1):
         todo = missing_spans(dest, total, connections)

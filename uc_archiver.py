@@ -40,6 +40,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -138,6 +139,14 @@ def free_bytes(path: Path) -> int | None:
         return shutil.disk_usage(path).free
     except OSError:
         return None
+
+
+# Disk claimed by runs in this process that have not finished yet. The check a
+# run does on its own is right for one download and wrong for several, and
+# running the catalogue is several: ten runs each wanting 12 GB all read the
+# same free space and all agree there is room.
+_room_lock = threading.Lock()
+_room_claimed = 0
 
 
 # ------------------------------------------------------------------- catalogue
@@ -363,8 +372,8 @@ def scrapling_problem() -> str | None:
 
 
 def resolve_share(url_or_hash: str, headed: bool = False,
-                  timeout: int = 90_000, tries: int = 3,
-                  pause: float = 6.0) -> Share:
+                  timeout: int = 90_000, tries: int = 0,
+                  pause: float = 0.0) -> Share:
     """Scrape the share page for the link the download actually comes from.
 
     This is the step the API cannot do. `check-file` says a file exists, what
@@ -397,6 +406,14 @@ def resolve_share(url_or_hash: str, headed: bool = False,
     # -- and not evidence that anything is wrong. Observed on a real run: the
     # same share resolved cleanly on the retry having failed outright the
     # first time, and without this it would have failed the whole entry.
+    #
+    # Observed again on a later run, on a different share, which is what moved
+    # the numbers: attempt 1 of 3 came back with no link. This is the step the
+    # whole tool rests on -- the API cannot do it -- so three tries was thin.
+    # Five, ten seconds apart, and the pause grows, because a challenge that
+    # is being rate limited wants longer than a challenge that was merely busy.
+    tries = tries or _env_int("UC_RESOLVE_TRIES", 5)
+    pause = pause or _env_float("UC_RESOLVE_PAUSE", 10.0)
     last = ""
     for attempt in range(1, max(1, tries) + 1):
         try:
@@ -405,9 +422,10 @@ def resolve_share(url_or_hash: str, headed: bool = False,
         except ShareUnavailable as exc:
             last = str(exc)
             if attempt < tries:
+                wait = pause * attempt
                 say(f"   link did not come out (attempt {attempt}/{tries}), "
-                    f"waiting {pause:.0f}s")
-                time.sleep(pause)
+                    f"waiting {wait:.0f}s")
+                time.sleep(wait)
     raise ShareUnavailable(last)
 
 
@@ -604,6 +622,7 @@ def download(url: str, dest: Path, expect: int = 0, timeout: int = 60,
     shows up when the extractor cannot read it, long after the download.
     """
     connections = connections or _default_connections()
+    parallel.set_budget(_env_int("UC_TOTAL_CONNECTIONS", connections))
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     # The bar, once, for whichever connection ends up doing the work -- so the
@@ -707,6 +726,20 @@ def _connection_plan(connections: int) -> list[int]:
     lower = [c for c in parallel.DOWNGRADE_TO if c < connections]
     return [connections] + lower + ([1] if 1 not in lower and connections > 1
                                     else [])
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
 
 
 def _cli_stream():
@@ -1590,33 +1623,84 @@ def main(argv: list[str] | None = None) -> int:
     remote_ext = Path(safe_remote).suffix or ext
     download_path = work_base / f"{stem}.download{remote_ext}"
     need = remote_size or 0
-    if need:
-        have = free_bytes(work_base)
-        if have is None:
-            warn(f"could not read the free space on {work_base}, so the room "
-                 f"check is being skipped")
-        elif have < need * 1.05:
+    # Room for the download, the unpacked tree and the finished archive, all at
+    # once -- a 3.1 MB .7z in this catalogue held 73.7 MB, and the archive is
+    # asked what it expands to rather than having it guessed.
+    want = need
+    if need and download_path.suffix.lower() in (".7z", ".zip"):
+        try:
+            want += archiver.unpacked_size(download_path) or 0
+        except Exception:
+            pass                       # unknown until it is there; the download
+                                        # size alone is still checked
+    reservation = _claim_room(work_base, want, stem) if want else None
+    try:
+        return _run_from_download(share, args, profile, work_base, out_dir,
+                                  stem, ext, archiver, download_path, need,
+                                  remote_name, reservation)
+    finally:
+        if reservation:
+            _release_room(reservation)
+
+
+def _claim_room(base: Path, want: int, label: str):
+    """Reserve disk for this run, counting what other runs have already taken.
+
+    The check used to be each run looking at the whole disk and each passing.
+    That is fine for one download and wrong for several: ten runs each wanting
+    12 GB all see the same free space and all agree there is room, and then the
+    volume fills. The claim is taken against a shared total and given back when
+    the run ends, so the second run in a queue is measured against what the
+    first one is really using rather than against a number that is about to
+    stop being true.
+
+    Returns None when the free space cannot be read, which the caller reports
+    as a skipped check rather than a failure -- the same as before.
+    """
+    global _room_claimed
+    have = free_bytes(base)
+    if have is None:
+        warn(f"could not read the free space on {base}, so the room check is "
+             f"being skipped")
+        return None
+    with _room_lock:
+        room = have - _room_claimed
+        if room < want * 1.05:
             raise SystemExit(
-                f"not enough room: {human(need)} needed in {work_base}, "
-                f"{human(have)} free"
+                f"not enough room for {label}: {human(want)} needed, "
+                f"{human(room)} free once {human(_room_claimed)} already "
+                f"claimed by other runs in {base}"
             )
+        _room_claimed += want
+    return want
+
+
+def _release_room(amount: int) -> None:
+    global _room_claimed
+    with _room_lock:
+        _room_claimed = max(0, _room_claimed - amount)
+
+
+def _run_from_download(share, args, profile, work_base, out_dir, stem, ext,
+                       archiver, download_path, need, remote_name, reservation):
+    """The rest of the run, once the room for it has been claimed."""
     # With a job running the download reports into it and takes its stop flag.
     # On the plain command line there is no job, so it is None and the
     # downloader behaves exactly as it always has.
-        import jobs
-        job = jobs.current()
-        # Held for the whole run, not just the fetch: two runs of one entry
-        # deadlock on the shared partial, and a hang with no error is a bad
-        # thing to hand someone.
-        try:
-            with _RunLock(download_path, safe_remote):
-                got = download(share.download_url, download_path, expect=need,
-                               timeout=args.timeout, referer=share.page_url,
-                               progress=jobs.bind_progress(job) if job else None,
-                               cancel=job.stop_requested if job else None)
-        except AlreadyRunning as exc:
-            raise SystemExit(str(exc))
-        say(f"   {human(got)} in {download_path.name}")
+    import jobs
+    job = jobs.current()
+    # Held for the whole run, not just the fetch: two runs of one entry
+    # deadlock on the shared partial, and a hang with no error is a bad
+    # thing to hand someone.
+    try:
+        with _RunLock(download_path, remote_name):
+            got = download(share.download_url, download_path, expect=need,
+                           timeout=args.timeout, referer=share.page_url,
+                           progress=jobs.bind_progress(job) if job else None,
+                           cancel=job.stop_requested if job else None)
+    except AlreadyRunning as exc:
+        raise SystemExit(str(exc))
+    say(f"   {human(got)} in {download_path.name}")
 
     if Path(safe_remote).stem.lower() != Path(download_path).stem.lower() and "." in safe_remote:
         say(f"   the host calls it {safe_remote}")

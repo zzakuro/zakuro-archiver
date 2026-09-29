@@ -1773,6 +1773,90 @@ def _span_retry_scenarios(checks, tmp: Path, parallel, Server, threading) -> Non
     total = len(payload)
     quarter = total // 4
 
+    # -- one connection budget for the process, not one per download ------
+    # The throttle is per IP, so ten downloads each taking eight connections
+    # is eighty sockets against a limit that eight was already the wrong side
+    # of once. UC_CONNECTIONS is what a single download would like;
+    # UC_TOTAL_CONNECTIONS is what it may have at once, shared out between
+    # whatever is running.
+    previous = parallel.budget()
+    try:
+        parallel.set_budget(3)
+        checks.check("budget: it starts empty and says what is allowed",
+                     parallel.budget() == (0, 3), str(parallel.budget()))
+        for _ in range(3):
+            parallel._acquire_slot()
+        checks.check("budget: three can be held at once",
+                     parallel.budget() == (3, 3), str(parallel.budget()))
+        # A fourth has to wait rather than open a fourth socket.
+        got_through = []
+
+        def grab():
+            parallel._acquire_slot()
+            got_through.append(True)
+
+        waiter = threading.Thread(target=grab, daemon=True)
+        waiter.start()
+        time.sleep(0.4)
+        checks.check("budget: a fourth waits instead of taking a fourth slot",
+                     not got_through and parallel.budget()[0] == 3,
+                     f"got through: {bool(got_through)}")
+        parallel._release_slot()
+        waiter.join(timeout=3)
+        checks.check("budget: and it goes through once one is given back",
+                     bool(got_through), f"got through: {bool(got_through)}")
+        for _ in range(3):
+            parallel._release_slot()
+        time.sleep(0.15)
+        checks.check("budget: everything given back leaves it empty",
+                     parallel.budget()[0] == 0, str(parallel.budget()))
+        # A slot left held by a failure would shrink the budget for everything
+        # else, so the count must never go negative.
+        parallel._release_slot()
+        checks.check("budget: an extra release cannot make it negative",
+                     parallel.budget()[0] == 0, str(parallel.budget()))
+    finally:
+        parallel.set_budget(previous[1] or parallel.DEFAULT_CONNECTIONS)
+
+    # -- disk one run has claimed is not available to the next -------------
+    # Each run reading the whole disk and each passing is right for one
+    # download and wrong for several, which is what running the catalogue is.
+    import shutil as _sh
+    base = tmp / "room"
+    base.mkdir()
+    real_free = uc.free_bytes
+    try:
+        uc.free_bytes = lambda p: 10_000
+        first = uc._claim_room(base, 4_000, "first")
+        checks.check("room: a run that fits is allowed in", first == 4_000,
+                     str(first))
+        second = uc._claim_room(base, 4_000, "second")
+        checks.check("room: and the next one too, there is room for both",
+                     second == 4_000, str(second))
+        try:
+            uc._claim_room(base, 4_000, "third")
+            outcome = "allowed"
+        except SystemExit as exc:
+            outcome = str(exc)
+        checks.check("room: a third is refused, the first two took the room",
+                     outcome != "allowed", outcome[:90])
+        checks.check("room: and the refusal says what is already claimed",
+                     "claimed" in outcome, outcome[:90])
+        uc._release_room(first)
+        third = uc._claim_room(base, 4_000, "third")
+        checks.check("room: and it fits once the first finishes",
+                     third == 4_000, str(third))
+        uc._release_room(second)
+        uc._release_room(third)
+        # Unreadable free space is a skipped check, never a refusal.
+        uc.free_bytes = lambda p: None
+        checks.check("room: a volume that cannot be measured is not a refusal",
+                     uc._claim_room(base, 99_000_000, "blind") is None,
+                     "refused")
+    finally:
+        uc.free_bytes = real_free
+        _sh.rmtree(base, ignore_errors=True)
+
     # -- the connection plan: start high, walk down ----------------------
     # The host is not consistent about what it gives. Eight connections carried
     # 7.15 MB/s on a share that was not throttling and got a 429 on one that

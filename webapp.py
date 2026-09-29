@@ -221,7 +221,7 @@ class Handler(BaseHTTPRequestHandler):
             "out_dir": self.app.out_dir,
             "auth": bool(self.app.token),
             "connections": uc._default_connections(),
-            "surge_host": os.environ.get("SURGE_HOST", ""),
+            "budget": list(uc.parallel.budget()),
             "active": len(self.app.jobs.active()),
             "scrapling": uc.scrapling_problem(),
         }

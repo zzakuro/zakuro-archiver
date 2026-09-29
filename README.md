@@ -105,28 +105,34 @@ remembers it for the session.
 ```bash
 echo "UC_TOKEN=$(openssl rand -hex 16)" > .env
 docker compose up -d
-docker compose exec surge surge token      # for the Surge side, if it needs one
 open http://127.0.0.1:8073
 ```
 
-`compose.yaml` runs two containers, because there are two programs:
+One container, published on `127.0.0.1:8073` only. It binds `0.0.0.0` inside the
+container because that is the only way to be reachable at all, and is published on
+loopback so an unauthenticated way to start downloads never reaches the network.
 
-- **uc-archiver** — the pipeline and the page, published on `127.0.0.1:8073`
-  only. It binds `0.0.0.0` inside the container because that is the only way
-  to be reachable at all, and is published on loopback so an unauthenticated
-  way to start downloads never reaches the network.
-- **surge** — `ghcr.io/surgedm/surge` in server mode, **not** given a host
-  port. Its API can start downloads for anything that reaches it, and the only
-  thing that needs to is uc-archiver, over the compose network.
+`UC_CONNECTIONS` sets what a **single download** would like — 8 by default. It is
+a starting point rather than a setting: measured at 3.96 MB/s on four connections
+and 7.15 MB/s on eight against a share that was not throttling, while sixteen drew
+a 429. When the host rate limits, the count walks itself down through four to one
+and resumes from the bytes already on disk. `1` pins a single connection and skips
+the walk.
 
-`UC_CONNECTIONS` sets the built-in downloader's connection count — 8 by default.
-It is a **starting point rather than a setting**: measured at 3.96 MB/s on four
-connections and 7.15 MB/s on eight against a share that was not throttling, while
-sixteen drew a 429. When the host rate limits, the count walks itself down
-through four to one and resumes from the bytes already on disk. `1` pins a single
-connection and skips the walk.
+`UC_TOTAL_CONNECTIONS` is how many the **process** may have at once across every
+running job, also 8. It matters more than the first when several downloads run
+together: the host's limit is per IP, so N downloads each taking eight is N times
+eight against a single ceiling. A job waits for a slot rather than opening a
+connection it is not allowed.
 
-`SURGE_HOST` / `SURGE_TOKEN` hand downloads to the sidecar instead.
+There is no external download manager. One was configured here and never read —
+`SURGE_HOST` and `SURGE_TOKEN` were declared in the image and echoed onto the
+status page while nothing acted on them. Measuring it settled the question:
+aria2, an independent and mature implementation, matched the built-in downloader
+to within noise on the same file and the same machine (6.36 against 7.15 MB/s at
+eight connections, 3.55 against 3.96 at four), and the limiter that decides
+throughput is the share and the IP address, not the client. So the sidecar is gone
+and the container gains no dependency for it.
 
 Two things the image does not have, both explained where they are missed:
 **rar** is proprietary and not redistributable, so 7-Zip is there instead and

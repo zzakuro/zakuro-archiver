@@ -55,15 +55,13 @@ VOLUME ["/work"]
 ENV PYTHONUNBUFFERED=1 \
     WORK_DIR=/work \
     OUTPUT_DIR=/work/out \
-    # Connections per download, and a starting point rather than a setting:
-    # measured 3.96 MB/s on four and 7.15 MB/s on eight against a share that
-    # was not throttling, while sixteen drew a 429. So it starts here and
-    # walks itself down to four, then one, if the host rate limits.
+    # Connections a single download would like, and how many the process may
+    # have at once across every job. The second is the one that matters when
+    # several run together: the host's limit is per IP, so N downloads each
+    # taking eight is N times eight against one limit. Both are starting
+    # points; a throttled download walks its own count down on its own.
     UC_CONNECTIONS=8 \
-    # Set to a Surge daemon's host:port to hand downloads to it instead.
-    # Unset, the built-in downloader above is used and nothing changes.
-    SURGE_HOST= \
-    SURGE_TOKEN=
+    UC_TOTAL_CONNECTIONS=8
 
 # Reports whether the browser this depends on is actually usable, which is the
 # one thing that fails silently otherwise.
