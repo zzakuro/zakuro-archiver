@@ -1791,19 +1791,41 @@ def _span_retry_scenarios(checks, tmp: Path, parallel, Server, threading) -> Non
             parallel.fetch_parallel(dead.url, dest, total, connections=4,
                                    timeout=20)
             failed = False
-        except (OSError, parallel.DownloadCancelled):
-            failed = True
-        except Exception:
-            failed = True
+            why = "it reported success"
+        except SystemExit as exc:
+            # SystemExit is a BaseException, so a bare `except Exception` here
+            # would let it straight through and take the whole run with it.
+            failed, why = True, str(exc)
+        except Exception as exc:
+            failed, why = True, f"{type(exc).__name__}: {exc}"
         checks.check("retry: a span that never moves gives up instead of "
-                     "looping for ever", failed, "it reported success")
+                     "looping for ever", failed, why)
         # Only the throttled span's own requests: the other three each make one
-        # and succeed, so counting the whole server understates nothing and
-        # overstates the budget.
+        # and succeed. Each pass is a fresh budget for the straggler, so it is
+        # asked PARALLEL_PASSES times over rather than once.
         throttled = [s for s, _ in dead.asked if s == 0]
-        checks.check("retry: and it stops at the budget, not far past it",
-                     len(throttled) == parallel.SPAN_MAX_TRIES + 1,
+        checks.check("retry: and it gives up on a schedule, not far past it",
+                     len(throttled) == (parallel.SPAN_MAX_TRIES + 1)
+                     * parallel.PARALLEL_PASSES,
                      f"{len(throttled)} attempts")
+        # The reason for running in passes at all: a quarter of the file being
+        # throttled must not cost the three quarters that were fine. This is the
+        # 169 MB of good data the old code used to throw away.
+        survivors = sorted({s for s, _ in dead.asked if s != 0})
+        checks.check("retry: the spans that were not throttled were still "
+                     "fetched, on the first pass", len(survivors) == 3,
+                     str(survivors))
+        on_disk = dest.read_bytes() if dest.is_file() else b""
+        checks.check("retry: and the spans that did work are on disk, correct",
+                     len(on_disk) == total
+                     and on_disk[quarter:] == payload[quarter:],
+                     f"{len(on_disk)} bytes")
+        checks.check("retry: the throttled span is left as a hole rather than "
+                     "filled with something invented",
+                     set(on_disk[:quarter]) == {0}, "not empty")
+        checks.check("retry: the sidecar is kept, so a re-run takes the gaps "
+                     "rather than starting again",
+                     parallel.spans_file(dest).is_file(), "no sidecar")
     finally:
         dead.close()
 

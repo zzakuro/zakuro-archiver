@@ -56,6 +56,12 @@ SPAN_MAX_TRIES = 10
 SPAN_RETRY_DELAY = 1.0
 SPAN_RETRY_MAX_DELAY = 30.0
 
+# How many times the whole fetch is re-split and asked for again when some
+# chunks are still being throttled. Each pass is a fresh budget per chunk, so
+# this multiplies patience rather than replacing it -- and it is what turns a
+# partially-throttled run from a failure into a slower success.
+PARALLEL_PASSES = 3
+
 
 def retry_delay(tries: int) -> float:
     """How long to wait before attempt `tries`+1. Doubling, then capped.
@@ -527,6 +533,14 @@ def fetch_parallel(url: str, dest: Path, total: int, connections: int = DEFAULT_
     `total` is the whole file. What is already there is taken from the sidecar
     rather than the file size, so a run that died after preallocating is not
     mistaken for a finished download.
+
+    Runs in passes. A span that runs out of budget does not fail the download:
+    the healthy ones finish, the file and the sidecar both survive, and the
+    leftovers are re-split and asked for again. That is the difference between
+    a run that always makes progress and one that throws away a working
+    download because a quarter of it was being throttled -- which is what a
+    16-connection run did at 62% of a 271 MB file, holding 169 MB of good
+    data and failing anyway.
     """
     if progress is None:
         progress = Progress(total=total)
@@ -535,25 +549,10 @@ def fetch_parallel(url: str, dest: Path, total: int, connections: int = DEFAULT_
         # total, or the bar measures against nothing.
         progress.total = total
 
-    done_spans = list(read_spans(dest))
-    todo = missing_spans(dest, total, connections)
-    if not todo:
-        # Nothing left to fetch. The bar has counted nothing this run, so it
-        # has to be told the file is whole -- otherwise it closes on 0% after
-        # a resume that had, in fact, just finished the job.
-        size = dest.stat().st_size if dest.is_file() else 0
-        progress.total = total
-        progress.done = size
-        return size
-
-    # Sized up front so no thread extends the file past the end while another
-    # is still filling in earlier bytes.
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with open(dest, "ab") as handle:
-        handle.truncate(total)
-
     stop = threading.Event()
     lock = threading.Lock()
+    dead = threading.Semaphore(0)
 
     def share_cancel() -> bool:
         if cancel is not None and cancel():
@@ -577,8 +576,12 @@ def fetch_parallel(url: str, dest: Path, total: int, connections: int = DEFAULT_
         failing -- a fixed budget of, say, 5 would kill a slow but healthy
         download that hiccuped five times over twenty minutes.
 
+        When the budget runs out this reports the failure rather than raising
+        it, so the spans around it still get to finish.
+
         Bytes already written are recorded in the sidecar as they are confirmed,
-        so a later run resumes them rather than asking again.
+        so a later pass -- or a later run -- resumes them rather than asking
+        again.
         """
         have = 0                      # bytes of this span already on disk
         tries = 0                     # attempts that produced nothing, in a row
@@ -613,29 +616,65 @@ def fetch_parallel(url: str, dest: Path, total: int, connections: int = DEFAULT_
                 else:
                     tries += 1
                 if tries > SPAN_MAX_TRIES:
-                    raise
+                    report(f"   {span.header} is still being throttled after "
+                           f"{SPAN_MAX_TRIES} tries; leaving it for another pass")
+                    dead.release()
+                    return 0
                 report(f"   {span.header} interrupted ({exc}); "
                        f"retry {tries} of {SPAN_MAX_TRIES} at byte "
                        f"{span.start + have} in {retry_delay(tries):.0f}s")
                 _sleep_or_cancel(retry_delay(tries), stop, cancel)
 
-    with ThreadPoolExecutor(max_workers=len(todo)) as pool:
-        for _ in pool.map(worker, todo):
-            pass
-    # Nothing above discards the file on a failure, and that is the point.
-    #
-    # Every span in the sidecar is a verified 206 read that returned its full
-    # length -- including when the failure is a Range answered with 200, since
-    # that thread raises before it writes anything -- so none of it is suspect.
-    # Discarding used to throw away 169 MB of good data when a 16-connection
-    # run was rate limited at 62%, and then fetch the whole file again on one
-    # connection: 701s against 180s.
-    #
-    # Leaving a preallocated file full of holes is safe precisely because the
-    # sidecar goes with it. The next run asks the sidecar rather than the size,
-    # which is the whole reason the sidecar exists; removing both is what makes
-    # a file that only its length could be mistaken for. A stop and a failure
-    # are the same case here, so both just propagate.
+    for attempt in range(1, PARALLEL_PASSES + 1):
+        todo = missing_spans(dest, total, connections)
+        if not todo:
+            # Nothing left to fetch. The bar has counted nothing this run, so
+            # it has to be told the file is whole -- otherwise it closes on 0%
+            # after a resume that had, in fact, just finished the job.
+            size = dest.stat().st_size if dest.is_file() else 0
+            progress.total = total
+            progress.done = size
+            spans_file(dest).unlink(missing_ok=True)
+            return size
+        if attempt == 1:
+            # Sized up front so no thread extends the file past the end while
+            # another is still filling in earlier bytes. Done inside the loop
+            # rather than before it because missing_spans deletes a full-length
+            # file that has no sidecar -- the preallocated case -- and asking it
+            # twice deleted the file that had just been recreated for the
+            # workers to write into.
+            with open(dest, "ab") as handle:
+                handle.truncate(total)
+        if attempt > 1:
+            covered = sum(b - a + 1 for a, b in read_spans(dest))
+            report(f"   pass {attempt}: {human(covered)} of {human(total)} "
+                   f"in hand, asking for the rest")
+        done_spans = list(read_spans(dest))
+        with ThreadPoolExecutor(max_workers=len(todo)) as pool:
+            for _ in pool.map(worker, todo):
+                pass
+        if dead.acquire(blocking=False):
+            if attempt < PARALLEL_PASSES:
+                # Whatever the stragglers were, the ones that worked did. Sleep
+                # once between passes so a limiter that is time-windowed gets
+                # the whole window rather than another immediate re-ask.
+                _sleep_or_cancel(SPAN_RETRY_MAX_DELAY, stop, cancel)
+                continue
+            todo = missing_spans(dest, total, connections)
+            covered = sum(b - a + 1 for a, b in read_spans(dest))
+            raise SystemExit(
+                f"the host is still throttling {len(todo)} chunk(s) after "
+                f"{PARALLEL_PASSES} passes: {human(covered)} of {human(total)} "
+                f"downloaded, re-run to continue"
+            )
+    else:
+        # Every pass exhausted its budget with chunks still missing.
+        todo = missing_spans(dest, total, connections)
+        if todo:
+            raise SystemExit(
+                f"still missing {human(sum(s.length for s in todo))} after "
+                f"{PARALLEL_PASSES} passes, re-run to continue"
+            )
     spans_file(dest).unlink(missing_ok=True)
     return dest.stat().st_size
 
