@@ -119,9 +119,14 @@ open http://127.0.0.1:8073
   port. Its API can start downloads for anything that reaches it, and the only
   thing that needs to is uc-archiver, over the compose network.
 
-Set `UC_CONNECTIONS` for the built-in downloader (4 by default, 1 reverts to a
-single connection) and `SURGE_HOST` / `SURGE_TOKEN` to hand downloads to the
-sidecar instead.
+`UC_CONNECTIONS` sets the built-in downloader's connection count — 8 by default.
+It is a **starting point rather than a setting**: measured at 3.96 MB/s on four
+connections and 7.15 MB/s on eight against a share that was not throttling, while
+sixteen drew a 429. When the host rate limits, the count walks itself down
+through four to one and resumes from the bytes already on disk. `1` pins a single
+connection and skips the walk.
+
+`SURGE_HOST` / `SURGE_TOKEN` hand downloads to the sidecar instead.
 
 Two things the image does not have, both explained where they are missed:
 **rar** is proprietary and not redistributable, so 7-Zip is there instead and

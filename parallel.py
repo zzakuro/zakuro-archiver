@@ -37,7 +37,17 @@ from dataclasses import dataclass, field
 from typing import Any
 
 CHUNK_READ = 1 << 20
-DEFAULT_CONNECTIONS = 4
+
+# Eight, not the four the host's own page offers. Measured on a share that was
+# not throttling: 3.96 MB/s on four, 7.15 MB/s on eight -- the per-connection
+# share is about 1 MB/s and it scales. Sixteen gets rate limited, and a share
+# that is throttled wants four. So the count is a starting point rather than a
+# setting, and Throttled exists to walk it down.
+DEFAULT_CONNECTIONS = 8
+
+# Where to go when the host says no. Four is what the host itself suggests and
+# is the only count measured clean against a throttled share.
+DOWNGRADE_TO = (4, 1)
 
 # How many times one span may fail *without producing a byte* before the
 # download is failed. Progress forgives the count, so a slow but healthy span
@@ -174,6 +184,17 @@ def human(count: int) -> str:
 
 class DownloadCancelled(Exception):
     """Raised when the caller asked to stop."""
+
+
+class Throttled(Exception):
+    """The host is rate limiting, and some chunks are still missing.
+
+    Raised rather than reported, because the caller's answer to it is not to
+    give up but to ask for fewer connections and carry on from what is already
+    on disk. That is adaptive concurrency, and this host needs it: against a
+    share it is not throttling, 8 connections carries about 1.8x the
+    throughput of 4, and against a share it is, 4 is clean and 8 is not.
+    """
 
 
 class RangeUnsupported(Exception):
@@ -375,6 +396,15 @@ def missing_spans(dest: Path, total: int, wanted: int) -> list[Span]:
         todo.append(Span(at, total - 1))
     report(f"   resuming at {human(covered)} of {human(total)}")
     return todo
+
+
+def _covered(dest: Path) -> int:
+    """How many bytes the sidecar says are on disk, counted by range.
+
+    Counting lengths rather than taking the last end, so an overlapping pair
+    does not claim more than it holds.
+    """
+    return sum(b - a + 1 for a, b in read_spans(dest))
 
 
 def compact_prefix(dest: Path) -> int:
@@ -667,13 +697,22 @@ def fetch_parallel(url: str, dest: Path, total: int, connections: int = DEFAULT_
                 # the whole window rather than another immediate re-ask.
                 _sleep_or_cancel(SPAN_RETRY_MAX_DELAY, stop, cancel)
                 continue
-            todo = missing_spans(dest, total, connections)
-            covered = sum(b - a + 1 for a, b in read_spans(dest))
-            raise SystemExit(
-                f"the host is still throttling {len(todo)} chunk(s) after "
-                f"{PARALLEL_PASSES} passes: {human(covered)} of {human(total)} "
-                f"downloaded, re-run to continue"
+            left = missing_spans(dest, total, connections)
+            covered = _covered(dest)
+            raise Throttled(
+                f"{len(left)} chunk(s) still throttled after {PARALLEL_PASSES} "
+                f"passes at {connections} connections: {human(covered)} of "
+                f"{human(total)} downloaded"
             )
+        # No chunk ran out of budget, so the file should be whole. Checked
+        # with the sidecar rather than by asking missing_spans, which reports
+        # on the way out -- and a successful download used to end by announcing
+        # "resuming at 246.07 MiB of 246.07 MiB" on its way to finding nothing
+        # left to do.
+        if _covered(dest) >= total:
+            progress.done = total
+            spans_file(dest).unlink(missing_ok=True)
+            return dest.stat().st_size
     else:
         # Every pass exhausted its budget with chunks still missing.
         todo = missing_spans(dest, total, connections)

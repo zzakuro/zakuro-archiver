@@ -55,10 +55,11 @@ VOLUME ["/work"]
 ENV PYTHONUNBUFFERED=1 \
     WORK_DIR=/work \
     OUTPUT_DIR=/work/out \
-    # Connections per download. The host throttles per connection, so this is
-    # the single biggest lever on how long a fetch takes; 1 puts it back to
-    # the old behaviour if a link misbehaves.
-    UC_CONNECTIONS=4 \
+    # Connections per download, and a starting point rather than a setting:
+    # measured 3.96 MB/s on four and 7.15 MB/s on eight against a share that
+    # was not throttling, while sixteen drew a 429. So it starts here and
+    # walks itself down to four, then one, if the host rate limits.
+    UC_CONNECTIONS=8 \
     # Set to a Surge daemon's host:port to hand downloads to it instead.
     # Unset, the built-in downloader above is used and nothing changes.
     SURGE_HOST= \

@@ -24,7 +24,7 @@ services:
       # unauthenticated way to start downloads off the network.
       UC_HOST: "0.0.0.0"
       UC_TOKEN: "${UC_TOKEN:?set UC_TOKEN in .env, or the page has no auth}"
-      UC_CONNECTIONS: "4"
+      UC_CONNECTIONS: "8"
       # Hand downloads to the sidecar instead of fetching them here.
       SURGE_HOST: "surge:1700"
       SURGE_TOKEN: "${SURGE_TOKEN:-}"

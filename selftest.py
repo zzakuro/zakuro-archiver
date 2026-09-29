@@ -1758,6 +1758,109 @@ def _span_retry_scenarios(checks, tmp: Path, parallel, Server, threading) -> Non
     total = len(payload)
     quarter = total // 4
 
+    # -- the connection plan: start high, walk down ----------------------
+    # The host is not consistent about what it gives. Eight connections carried
+    # 7.15 MB/s on a share that was not throttling and got a 429 on one that
+    # was, so the count is a starting point and Throttled is how it moves.
+    checks.check("connections: eight walks down through four to one",
+                 uc._connection_plan(8) == [8, 4, 1], str(uc._connection_plan(8)))
+    checks.check("connections: four does not step through eight",
+                 uc._connection_plan(4) == [4, 1], str(uc._connection_plan(4)))
+    checks.check("connections: one stays one, because it was asked for",
+                 uc._connection_plan(1) == [1], str(uc._connection_plan(1)))
+    checks.check("connections: sixteen also lands on four and one",
+                 uc._connection_plan(16) == [16, 4, 1],
+                 str(uc._connection_plan(16)))
+    checks.check("connections: the default is eight",
+                 parallel.DEFAULT_CONNECTIONS == 8,
+                 str(parallel.DEFAULT_CONNECTIONS))
+
+    # fetch_parallel really does raise Throttled when the host will not serve
+    # some chunks, and keeps what it got. Asked for directly, so no probe is
+    # involved -- a probe asks for bytes=0-0, which is indistinguishable from a
+    # span at offset 0, and that ambiguity makes a live server useless here.
+    walled = Server(payload=payload, flaky={0: 999})
+    try:
+        d = tmp / "walled.bin"
+        try:
+            parallel.fetch_parallel(walled.url, d, total, connections=8,
+                                    timeout=20)
+            outcome = "finished"
+        except parallel.Throttled:
+            outcome = "throttled"
+        except Exception as exc:
+            outcome = f"{type(exc).__name__}: {exc}"
+        checks.check("connections: a host that throttles a chunk raises "
+                     "Throttled, not a bare failure", outcome == "throttled",
+                     outcome)
+        checks.check("connections: and the seven spans that worked are kept",
+                     d.is_file() and d.read_bytes()[quarter:] == payload[quarter:],
+                     "the good part was lost")
+    finally:
+        walled.close()
+
+    # And the walk itself. download() has to notice Throttled and try the next
+    # count, so that loop is driven with a stand-in rather than a real server:
+    # what is being checked is which connection counts it asks for, in what
+    # order, and that nothing is thrown away between attempts.
+    tried = []
+    real_fetch = parallel.fetch_parallel
+
+    def counting_fetch(url, dest, total, connections=8, **kw):
+        tried.append(connections)
+        if len(tried) == 1:
+            raise parallel.Throttled("stubbed: the host said no")
+        return real_fetch(url, dest, total, connections=connections, **kw)
+
+    parallel.fetch_parallel = counting_fetch
+    clean = Server(payload=payload)
+    try:
+        d = tmp / "downgrade.bin"
+        got = uc.download(clean.url, d, expect=total, timeout=20, connections=8)
+        checks.check("connections: a throttle drops the count and carries on",
+                     tried[:2] == [8, 4], f"tried {tried}")
+        checks.check("connections: and the file is whole afterwards",
+                     got == total and d.read_bytes() == payload,
+                     f"{got} of {total}")
+    finally:
+        parallel.fetch_parallel = real_fetch
+        clean.close()
+
+    # A host that throttles at every count is given up on, with the bytes kept.
+    # A host that throttles at every count is given up on, and the bytes are
+    # still named in the reason. The server itself is clean -- a probe asks for
+    # bytes=0-0, which the offset-0 throttle would catch, and that would stop
+    # the parallel path being entered at all.
+    walked = []
+
+    def always_throttled(url, dest, total, connections=8, **kw):
+        walked.append(connections)
+        raise parallel.Throttled("stubbed: the host said no")
+
+    clean2 = Server(payload=payload)
+    parallel.fetch_parallel = always_throttled
+    real_delay, real_max = parallel.SPAN_RETRY_DELAY, parallel.SPAN_RETRY_MAX_DELAY
+    parallel.SPAN_RETRY_DELAY = 0.01
+    parallel.SPAN_RETRY_MAX_DELAY = 0.05
+    try:
+        d = tmp / "nowhere.bin"
+        try:
+            uc.download(clean2.url, d, expect=total, timeout=20, connections=8)
+            outcome = "finished"
+        except SystemExit as exc:
+            outcome = str(exc)
+        except Exception as exc:
+            outcome = f"{type(exc).__name__}: {exc}"
+        checks.check("connections: a host that throttles at every count is "
+                     "given up on, and says so",
+                     "rate limiting" in outcome, outcome[:90])
+        checks.check("connections: and it tried all three before giving up",
+                     walked == [8, 4, 1], f"tried {walked}")
+    finally:
+        parallel.fetch_parallel = real_fetch
+        parallel.SPAN_RETRY_DELAY, parallel.SPAN_RETRY_MAX_DELAY = real_delay, real_max
+        clean2.close()
+
     # -- a throttled span is retried, and the rest keeps going:
     # The first span gets two 429s and then is served normally. Before this
     # change that first 429 failed the entire download.

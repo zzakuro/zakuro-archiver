@@ -618,42 +618,68 @@ def download(url: str, dest: Path, expect: int = 0, timeout: int = 60,
             if expect and abs(total - expect) > expect * _SIZE_TOLERANCE:
                 warn(f"the server says {human(total)} and the page said "
                      f"{human(expect)}; going with the server")
-            try:
-                got = parallel.fetch_parallel(
-                    url, dest, total, connections=connections, timeout=timeout,
-                    referer=referer, cancel=cancel, progress=bar)
-            except parallel.RangeUnsupported as exc:
-                # It sent the whole file instead of the slice asked for. That
-                # thread wrote nothing -- the check is before the write -- so
-                # spans recorded by the others are still verified 206 reads and
-                # are kept the same way. What is not kept is the file, because
-                # a host that ignores ranges cannot be trusted for the rest.
-                kept = parallel.compact_prefix(dest)
-                warn(f"{exc}; falling back to a single connection"
-                     + (f", keeping {human(kept)}" if kept else ""))
-                if not kept:
-                    dest.unlink(missing_ok=True)
-                bar.restart()
-            except parallel.DownloadCancelled:
-                parallel.clear_bar()
-                raise
-            except (OSError, urllib.error.URLError) as exc:
-                # The spans already written are real bytes -- a rate limit
-                # stops threads, it does not corrupt them -- so the run from
-                # byte 0 is kept and the single connection picks it up. Only
-                # if there is no usable prefix does the file go.
-                kept = parallel.compact_prefix(dest)
-                if kept:
-                    warn(f"parallel download failed ({exc}); keeping "
-                         f"{human(kept)} of it and continuing on one connection")
+            # Try the requested count, then fewer, if the host rate limits.
+            #
+            # The count is a starting point rather than a setting, because the
+            # host is not consistent about what it will give: eight connections
+            # carried 7.15 MB/s against a share that was not throttling, and
+            # got a 429 against one that was. Nothing is lost by walking down,
+            # because the file and the sidecar both survive and the next
+            # attempt resumes the gaps rather than starting the file again.
+            plan = _connection_plan(connections)
+            for attempt, wanted in enumerate(plan):
+                if attempt:
+                    warn(f"throttled at {plan[attempt - 1]} connections; "
+                         f"dropping to {wanted}")
+                try:
+                    got = parallel.fetch_parallel(
+                        url, dest, total, connections=wanted, timeout=timeout,
+                        referer=referer, cancel=cancel, progress=bar)
+                except parallel.Throttled:
+                    if wanted == plan[-1]:
+                        raise SystemExit(
+                            f"the host is rate limiting this share at every "
+                            f"connection count tried; "
+                            f"{human(parallel._covered(dest))} of "
+                            f"{human(total)} downloaded, re-run to continue"
+                        )
+                    continue
+                except parallel.RangeUnsupported as exc:
+                    # It sent the whole file instead of the slice asked for.
+                    # That thread wrote nothing -- the check is before the
+                    # write -- so spans recorded by the others are still
+                    # verified 206 reads and are kept the same way. What is
+                    # not kept is the file, because a host that ignores ranges
+                    # cannot be trusted for the rest.
+                    kept = parallel.compact_prefix(dest)
+                    warn(f"{exc}; falling back to a single connection"
+                         + (f", keeping {human(kept)}" if kept else ""))
+                    if not kept:
+                        dest.unlink(missing_ok=True)
+                    bar.restart()
+                    break
+                except parallel.DownloadCancelled:
+                    parallel.clear_bar()
+                    raise
+                except (OSError, urllib.error.URLError) as exc:
+                    # The spans already written are real bytes -- a rate limit
+                    # stops threads, it does not corrupt them -- so the run from
+                    # byte 0 is kept and the single connection picks it up. Only
+                    # if there is no usable prefix does the file go.
+                    kept = parallel.compact_prefix(dest)
+                    if kept:
+                        warn(f"parallel download failed ({exc}); keeping "
+                             f"{human(kept)} of it and continuing on one "
+                             f"connection")
+                    else:
+                        warn(f"parallel download failed ({exc}); falling back "
+                             f"to a single connection")
+                        dest.unlink(missing_ok=True)
+                    bar.restart()
+                    break
                 else:
-                    warn(f"parallel download failed ({exc}); falling back to "
-                         f"a single connection")
-                    dest.unlink(missing_ok=True)
-                bar.restart()
-            else:
-                bar.finish()
-                return got
+                    bar.finish()
+                    return got
 
     try:
         got = _download_single(url, dest, expect=expect, timeout=timeout,
@@ -663,6 +689,19 @@ def download(url: str, dest: Path, expect: int = 0, timeout: int = 60,
         raise
     bar.finish()
     return got
+
+
+def _connection_plan(connections: int) -> list[int]:
+    """The connection counts to try, in order, largest first.
+
+    Always ends at 1, because a single connection is the one path that cannot
+    be rate limited by connection count -- and the one the host's own page
+    implies is acceptable. A caller that asked for 1 gets only 1: someone who
+    pinned it has already decided.
+    """
+    lower = [c for c in parallel.DOWNGRADE_TO if c < connections]
+    return [connections] + lower + ([1] if 1 not in lower and connections > 1
+                                    else [])
 
 
 def _cli_stream():
