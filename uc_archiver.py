@@ -623,17 +623,33 @@ def download(url: str, dest: Path, expect: int = 0, timeout: int = 60,
                     url, dest, total, connections=connections, timeout=timeout,
                     referer=referer, cancel=cancel, progress=bar)
             except parallel.RangeUnsupported as exc:
-                # It sent the whole file instead of the slice asked for. The
-                # offsets it wrote are meaningless, so start again on one.
-                warn(f"{exc}; falling back to a single connection")
-                dest.unlink(missing_ok=True)
+                # It sent the whole file instead of the slice asked for. That
+                # thread wrote nothing -- the check is before the write -- so
+                # spans recorded by the others are still verified 206 reads and
+                # are kept the same way. What is not kept is the file, because
+                # a host that ignores ranges cannot be trusted for the rest.
+                kept = parallel.compact_prefix(dest)
+                warn(f"{exc}; falling back to a single connection"
+                     + (f", keeping {human(kept)}" if kept else ""))
+                if not kept:
+                    dest.unlink(missing_ok=True)
                 bar.restart()
             except parallel.DownloadCancelled:
                 parallel.clear_bar()
                 raise
             except (OSError, urllib.error.URLError) as exc:
-                warn(f"parallel download failed ({exc}); falling back to one connection")
-                dest.unlink(missing_ok=True)
+                # The spans already written are real bytes -- a rate limit
+                # stops threads, it does not corrupt them -- so the run from
+                # byte 0 is kept and the single connection picks it up. Only
+                # if there is no usable prefix does the file go.
+                kept = parallel.compact_prefix(dest)
+                if kept:
+                    warn(f"parallel download failed ({exc}); keeping "
+                         f"{human(kept)} of it and continuing on one connection")
+                else:
+                    warn(f"parallel download failed ({exc}); falling back to "
+                         f"a single connection")
+                    dest.unlink(missing_ok=True)
                 bar.restart()
             else:
                 bar.finish()

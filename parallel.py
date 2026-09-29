@@ -38,6 +38,34 @@ from typing import Any
 
 CHUNK_READ = 1 << 20
 DEFAULT_CONNECTIONS = 4
+
+# How many times one span may fail *without producing a byte* before the
+# download is failed. Progress forgives the count, so a slow but healthy span
+# that hiccups now and then never runs out of budget. Ten consecutive silent
+# failures means the host is not serving this slice at all, and waiting longer
+# only wastes the run.
+SPAN_MAX_TRIES = 10
+
+# Waiting between those tries, doubling each time up to the cap. A flat delay
+# is what a first implementation does and it is wrong for a host that rate
+# limits over a time window rather than a request count: ten one-second waits
+# is ten seconds of patience, and this host's window is longer than that, so
+# every retry landed inside the penalty and the run died still inside it.
+# Measured against vikingfile.com -- a 429 at 16 connections retried on a flat
+# 1s never got back in.
+SPAN_RETRY_DELAY = 1.0
+SPAN_RETRY_MAX_DELAY = 30.0
+
+
+def retry_delay(tries: int) -> float:
+    """How long to wait before attempt `tries`+1. Doubling, then capped.
+
+    Capped rather than unbounded because the alternative -- doubling forever --
+    turns a host that is down for an hour into a run that sits there for an
+    hour. Thirty seconds is long enough to outlast a rate-limit window and
+    short enough that giving up is still a decision somebody made.
+    """
+    return min(SPAN_RETRY_DELAY * (2 ** max(0, tries - 1)), SPAN_RETRY_MAX_DELAY)
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"
@@ -229,17 +257,30 @@ class Progress:
 
 @dataclass(frozen=True)
 class Span:
-    """A half-open byte range, `start` to `end` inclusive."""
+    """A byte range, `start` to `end` inclusive.
+
+    An `end` of None means "to the end of the file", which is what a resume
+    asks for. Span could not say it before, because it has no way to name the
+    end of a file whose length is not yet known -- so a resume passed
+    `Span(resume_from, 0)` and the header came out `bytes=300-0`, end before
+    start. A server is entitled to 416 that, and the test server answered it
+    with an empty 206, so a resumed download silently got nothing and then
+    reported itself short.
+    """
 
     start: int
-    end: int
+    end: int | None = None
 
     @property
     def length(self) -> int:
+        if self.end is None:
+            raise ValueError("an open-ended range has no length")
         return self.end - self.start + 1
 
     @property
     def header(self) -> str:
+        if self.end is None:
+            return f"bytes={self.start}-"
         return f"bytes={self.start}-{self.end}"
 
 
@@ -330,6 +371,69 @@ def missing_spans(dest: Path, total: int, wanted: int) -> list[Span]:
     return todo
 
 
+def compact_prefix(dest: Path) -> int:
+    """Keep the valid run from byte 0, drop the rest, and say how much that was.
+
+    The parallel fetch writes each span at its own offset, so a run that is
+    part way through has real bytes scattered across a preallocated file with
+    holes between them. `fetch_single` resumes by asking for `Range: bytes=N-`
+    where N is the *file size* -- which here is the whole file, so it cannot
+    take over: it would ask for a range past the end and call the download
+    finished. So until now the only safe handover was to throw the file away.
+
+    Throwing it away is expensive. Observed on a real 16-connection run: the
+    host answered 429 after 169 MiB of good data, the fallback dropped all of
+    it, and the whole file was fetched again on one connection -- 701s against
+    180s for the four-connection run that never tripped the limit.
+
+    No copying is needed. A contiguous run starting at 0 is already sitting
+    where fetch_single expects a prefix to be, so this only has to find where
+    that run ends and truncate there. Anything past it is a hole or a span that
+    never finished, and both go.
+
+    Returns the prefix length, or 0 when there is nothing usable at the front --
+    in which case the caller should discard, as before.
+    """
+    done = sorted(read_spans(dest))
+    if not done or done[0][0] != 0:
+        return 0
+    end = done[0][1]
+    for start, stop in done[1:]:
+        if start <= end + 1:              # contiguous, or overlapping
+            end = max(end, stop)
+        else:
+            break                         # a hole: nothing past here is reachable
+    keep = end + 1
+    try:
+        with open(dest, "r+b") as handle:
+            handle.truncate(keep)
+    except OSError:
+        return 0
+    spans_file(dest).unlink(missing_ok=True)
+    return keep
+
+
+def _sleep_or_cancel(seconds: float, stop: threading.Event, cancel=None) -> None:
+    """Wait out a retry pause, but give up the moment a stop is asked for.
+
+    Polls the caller's `cancel` itself rather than only waiting on `stop`,
+    because `stop` is set by workers that are inside a read loop. When the
+    other spans have already finished -- which is exactly the situation a retry
+    pause tends to happen in, since a throttled span is often the only one left
+    -- nothing is left to notice a stop, and the run would sit out the whole
+    delay. Measured: a cancel asked for at 0.3s went unheeded for 10.3s.
+    """
+    deadline = time.time() + seconds
+    while True:
+        if stop.is_set() or (cancel is not None and cancel()):
+            stop.set()
+            raise DownloadCancelled()
+        left = deadline - time.time()
+        if left <= 0:
+            return
+        stop.wait(min(left, 0.1))
+
+
 def _open(url: str, span: Span | None, referer: str, timeout: int):
     headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
     if referer:
@@ -366,33 +470,51 @@ def probe(url: str, referer: str = "", timeout: int = 30) -> tuple[bool, int]:
 
 
 def _fetch_span(url: str, dest: Path, span: Span, referer: str, timeout: int,
-                progress: Progress, cancel, handle) -> int:
-    """Write one span into `dest` at its own offset. Returns bytes written.
+                progress: Progress, cancel, handle,
+                start_at: int = 0, tally: list[int] | None = None) -> int:
+    """Write part of one span into `dest` at its own offset. Returns bytes written.
+
+    `start_at` is how far into the span to begin, so a retry asks only for what
+    is still missing instead of the whole slice again. `tally` is filled in even
+    when this raises, because the caller needs to know whether the attempt got
+    any bytes at all -- that is what decides whether a failure counts against
+    the retry budget or is forgiven.
 
     The handle is this thread's own, opened by the caller, so nothing here
     seeks on a shared file pointer.
     """
     written = 0
-    with _open(url, span, referer, timeout) as resp:
-        status = getattr(resp, "status", 200) or 200
-        if status != 206:
-            # The host sent the whole file rather than the slice asked for.
-            # Every other thread is about to do the same into its own offset.
-            raise RangeUnsupported(f"server answered {status} to a Range request")
-        handle.seek(span.start)
-        while True:
-            if cancel is not None and cancel():
-                raise DownloadCancelled()
-            block = resp.read(CHUNK_READ)
-            if not block:
-                break
-            handle.write(block)
-            written += len(block)
-            if progress is not None:
-                progress.advance(len(block))
-    if written != span.length:
+    begin = span.start + start_at
+    if tally is not None:
+        tally[0] = 0
+    try:
+        with _open(url, Span(begin, span.end) if start_at else span,
+                   referer, timeout) as resp:
+            status = getattr(resp, "status", 200) or 200
+            if status != 206:
+                # The host sent the whole file rather than the slice asked for.
+                # Every other thread is about to do the same into its own offset.
+                raise RangeUnsupported(f"server answered {status} to a Range request")
+            handle.seek(begin)
+            while True:
+                if cancel is not None and cancel():
+                    raise DownloadCancelled()
+                block = resp.read(CHUNK_READ)
+                if not block:
+                    break
+                handle.write(block)
+                written += len(block)
+                if tally is not None:
+                    tally[0] = written
+                if progress is not None:
+                    progress.advance(len(block))
+    finally:
+        if tally is not None:
+            tally[0] = written
+    if written != span.length - start_at:
         raise OSError(
-            f"chunk {span.header} came back short: {written} of {span.length} bytes"
+            f"chunk {span.header} came back short: {written} of "
+            f"{span.length - start_at} bytes"
         )
     return written
 
@@ -439,37 +561,81 @@ def fetch_parallel(url: str, dest: Path, total: int, connections: int = DEFAULT_
         return stop.is_set()
 
     def worker(span: Span) -> int:
-        if stop.is_set():
-            raise DownloadCancelled()
-        with open(dest, "r+b") as handle:      # this thread's own handle
-            written = _fetch_span(url, dest, span, referer, timeout,
-                                  progress, share_cancel, handle)
-        # Recorded only once the span is complete, so the sidecar never claims
-        # bytes that are not there.
-        with lock:
-            done_spans.append((span.start, span.end))
-            write_spans(dest, done_spans)
-        return written
+        """Fetch one span, retrying it alone rather than failing the download.
 
-    try:
-        with ThreadPoolExecutor(max_workers=len(todo)) as pool:
-            for _ in pool.map(worker, todo):
-                pass
-    except DownloadCancelled:
-        # A stop is not a failure. What was fetched is real and the sidecar
-        # says which parts, so it is kept and a later run carries on from
-        # here rather than starting the file again.
-        raise
-    except RangeUnsupported:
-        # The offsets it wrote mean nothing, so the preallocated file has to go
-        # rather than be handed on as a download.
-        _discard(dest)
-        raise
-    except BaseException:
-        # A real failure. The file is the right length and full of holes, and
-        # a size check alone would take it for a finished download next time.
-        _discard(dest)
-        raise
+        A rate-limited host does not stop the whole file, it stops the
+        connections it has decided to stop -- and that is the shape of the
+        failure this used to get wrong. One 429 out of sixteen spans used to
+        propagate out of pool.map, take the download down with it, and force a
+        restart on a single connection: measured at 62% of a 271 MB file, 701s
+        against 180s for the run that was never rate limited.
+
+        So each span carries its own budget, spends it only on attempts that
+        produced nothing, resumes from wherever it got to, and keeps the other
+        spans running while it waits. The counter is progress-gated rather than
+        a lifetime count, because a span that is moving is not a span that is
+        failing -- a fixed budget of, say, 5 would kill a slow but healthy
+        download that hiccuped five times over twenty minutes.
+
+        Bytes already written are recorded in the sidecar as they are confirmed,
+        so a later run resumes them rather than asking again.
+        """
+        have = 0                      # bytes of this span already on disk
+        tries = 0                     # attempts that produced nothing, in a row
+        while True:
+            if stop.is_set():
+                raise DownloadCancelled()
+            tally: list[int] = [0]
+            try:
+                with open(dest, "r+b") as handle:   # this thread's own handle
+                    wrote = _fetch_span(url, dest, span, referer, timeout,
+                                        progress, share_cancel, handle,
+                                        start_at=have, tally=tally)
+                have += wrote
+                with lock:
+                    done_spans.append((span.start, span.end))
+                    write_spans(dest, done_spans)
+                return span.length
+            except DownloadCancelled:
+                raise
+            except RangeUnsupported:
+                # Not a throttle: the host ignored the Range, so the whole
+                # parallel premise is void and the caller has to know that.
+                raise
+            except (OSError, urllib.error.URLError) as exc:
+                have += tally[0]
+                if tally[0]:
+                    tries = 0        # it moved, so this is not a failure yet
+                    with lock:
+                        if have < span.length:
+                            done_spans.append((span.start, span.start + have - 1))
+                            write_spans(dest, done_spans)
+                else:
+                    tries += 1
+                if tries > SPAN_MAX_TRIES:
+                    raise
+                report(f"   {span.header} interrupted ({exc}); "
+                       f"retry {tries} of {SPAN_MAX_TRIES} at byte "
+                       f"{span.start + have} in {retry_delay(tries):.0f}s")
+                _sleep_or_cancel(retry_delay(tries), stop, cancel)
+
+    with ThreadPoolExecutor(max_workers=len(todo)) as pool:
+        for _ in pool.map(worker, todo):
+            pass
+    # Nothing above discards the file on a failure, and that is the point.
+    #
+    # Every span in the sidecar is a verified 206 read that returned its full
+    # length -- including when the failure is a Range answered with 200, since
+    # that thread raises before it writes anything -- so none of it is suspect.
+    # Discarding used to throw away 169 MB of good data when a 16-connection
+    # run was rate limited at 62%, and then fetch the whole file again on one
+    # connection: 701s against 180s.
+    #
+    # Leaving a preallocated file full of holes is safe precisely because the
+    # sidecar goes with it. The next run asks the sidecar rather than the size,
+    # which is the whole reason the sidecar exists; removing both is what makes
+    # a file that only its length could be mistaken for. A stop and a failure
+    # are the same case here, so both just propagate.
     spans_file(dest).unlink(missing_ok=True)
     return dest.stat().st_size
 
@@ -483,77 +649,119 @@ def _discard(dest: Path) -> None:
             pass
 
 
+def _throttled(exc: BaseException) -> bool:
+    """Is this the host pushing back rather than something being wrong?"""
+    code = getattr(exc, "code", None)
+    if isinstance(code, int):
+        return code == 429 or 500 <= code < 600
+    # No status: a dropped connection or a read timeout. Worth one more go.
+    return isinstance(exc, (urllib.error.URLError, TimeoutError, ConnectionError))
+
+
 def fetch_single(url: str, dest: Path, expect: int = 0, timeout: int = 60,
                  referer: str = "", cancel=None, progress: Progress | None = None,
                  size_tolerance: float = 0.0) -> int:
-    """One connection, with resume. The fallback, and the only path that works
-    when the host will not do ranges."""
+    """One connection, with resume and retry. The fallback, and the only path
+    that works when the host will not do ranges.
+
+    Retries because this is also where a rate-limited parallel run lands. It
+    used to make exactly one request: the 429 that had just stopped sixteen
+    spans arrived here too, and the whole run died on the first try having
+    already spent ten rounds of retrying. A 429 is the host saying "not now",
+    so it waits and asks again, from wherever it got to.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     have = dest.stat().st_size if dest.is_file() else 0
-    headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
-    if referer:
-        headers["Referer"] = referer
     if have and expect and have < expect:
         report(f"   resuming at {human(have)} of {human(expect)}")
-        headers["Range"] = f"bytes={have}-"
     elif have:
         have = 0
         dest.unlink(missing_ok=True)
-    resume_from = have
 
-    try:
-        resp = _open(url, Span(resume_from, 0) if resume_from else None,
-                     referer, timeout) if resume_from else \
-            urllib.request.urlopen(
-                urllib.request.Request(url, headers=headers), timeout=timeout)
-    except urllib.error.HTTPError as exc:
-        if exc.code == 416 and have:
-            if expect and have < expect * (1 - size_tolerance):
-                raise SystemExit(
-                    f"the server says the file is complete but only "
-                    f"{human(have)} is here against {human(expect)} expected; "
-                    f"delete the partial and start again"
-                ) from exc
-            report("   the server says the file is already complete")
-            if progress is not None:
-                progress.done = have
-            return have
-        raise SystemExit(f"download failed: HTTP {exc.code} {exc.reason}") from exc
-    except (urllib.error.URLError, OSError, TimeoutError) as exc:
-        raise SystemExit(f"download failed: {exc}") from exc
-
-    declared = int(resp.headers.get("Content-Length") or 0)
-    if declared:
-        # A byte count. For a 206 it is the remainder, so whatever is already
-        # on disk is added back to it.
-        total = declared + (resume_from if resp.status == 206 else 0)
-        exact = True
-    else:
-        # Nothing from the server, so the rounded figure on the page is all
-        # there is -- and it is approximate, hence the slack below.
-        total = expect
-        exact = False
-    if progress is not None:
-        progress.total = total or (progress.total or 0)
-        progress.done = resume_from
-    try:
-        with open(dest, "ab" if resume_from and resp.status == 206 else "wb") as out:
-            while True:
-                if cancel is not None and cancel():
-                    raise DownloadCancelled()
-                block = resp.read(CHUNK_READ)
-                if not block:
-                    break
-                out.write(block)
-                have += len(block)
+    stop = threading.Event()
+    tries = 0
+    total = 0
+    exact = False
+    while True:
+        if cancel is not None and cancel():
+            raise DownloadCancelled()
+        base = have
+        tally = [0]
+        headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
+        if referer:
+            headers["Referer"] = referer
+        if base:
+            headers["Range"] = f"bytes={base}-"
+        try:
+            resp = _open(url, Span(base) if base else None, referer, timeout)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 416 and have:
+                if expect and have < expect * (1 - size_tolerance):
+                    raise SystemExit(
+                        f"the server says the file is complete but only "
+                        f"{human(have)} is here against {human(expect)} "
+                        f"expected; delete the partial and start again"
+                    ) from exc
+                report("   the server says the file is already complete")
                 if progress is not None:
-                    progress.advance(len(block))
-    except (urllib.error.URLError, OSError, TimeoutError) as exc:
-        raise SystemExit(f"download interrupted at {human(have)}: {exc}") from exc
-    finally:
-        close = getattr(resp, "close", None)
-        if callable(close):
-            close()
+                    progress.done = have
+                return have
+            if not _throttled(exc):
+                raise SystemExit(
+                    f"download failed: HTTP {exc.code} {exc.reason}") from exc
+            last = exc
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            if not _throttled(exc):
+                raise SystemExit(f"download failed: {exc}") from exc
+            last = exc
+        else:
+            declared = int(resp.headers.get("Content-Length") or 0)
+            if declared:
+                # A byte count. For a 206 it is the remainder, so whatever is
+                # already on disk is added back to it.
+                total = declared + (base if resp.status == 206 else 0)
+                exact = True
+            else:
+                # Nothing from the server, so the rounded figure on the page is
+                # all there is -- and it is approximate, hence the slack below.
+                total = expect
+                exact = False
+            if progress is not None:
+                progress.total = total or (progress.total or 0)
+                progress.done = base
+            try:
+                with open(dest, "ab" if base and resp.status == 206 else "wb") as out:
+                    while True:
+                        if cancel is not None and cancel():
+                            raise DownloadCancelled()
+                        block = resp.read(CHUNK_READ)
+                        if not block:
+                            break
+                        out.write(block)
+                        have += len(block)
+                        tally[0] += len(block)
+                        if progress is not None:
+                            progress.advance(len(block))
+            except (urllib.error.URLError, OSError, TimeoutError) as exc:
+                last = exc
+            else:
+                last = None
+            finally:
+                close = getattr(resp, "close", None)
+                if callable(close):
+                    close()
+            if last is None:
+                break
+
+        if tally[0]:
+            tries = 0            # it moved, so this is not a failure yet
+        else:
+            tries += 1
+        if tries > SPAN_MAX_TRIES:
+            raise SystemExit(f"download failed: {last}")
+        report(f"   interrupted at {human(have)} ({last}); retry {tries} of "
+               f"{SPAN_MAX_TRIES} in {retry_delay(tries):.0f}s")
+        _sleep_or_cancel(retry_delay(tries), stop, cancel)
 
     # A file that stopped halfway is the failure that costs the most: it only
     # shows up when the extractor cannot read it, long after the download.

@@ -1564,6 +1564,356 @@ def _progress_bar_checks(checks) -> None:
                  f"done={restarted.done} rate={restarted.rate}")
 
 
+def _compaction_checks(checks) -> None:
+    """A rate-limited run keeps what it had instead of starting over.
+
+    Measured on a real 16-connection fetch: the host answered 429 at 62%, and
+    the fallback threw away 169 MB of verified bytes and fetched the file again
+    from nothing. 701s against 180s for the run that was never rate limited.
+
+    The bytes could not simply be handed over, because fetch_single resumes by
+    asking for `Range: bytes=<file size>-` and a preallocated parallel file is
+    already the full length -- so it would have asked past the end. A run from
+    byte 0 has to be cut back to one, which is what compact_prefix does.
+    """
+    import parallel
+
+    tmp = Path(tempfile.mkdtemp(prefix="uc-compact-"))
+    try:
+        _compaction_body(checks, tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _compaction_body(checks, tmp: Path) -> None:
+    """The body of the compaction checks, on a temp dir that gets cleaned up."""
+    import parallel
+
+    def make(name, total, spans, fill=None):
+        dest = tmp / name
+        with open(dest, "wb") as fh:
+            fh.truncate(total)
+            if fill:
+                for start, end in fill:
+                    fh.seek(start)
+                    # Never 0: a marker of zero is indistinguishable from the
+                    # hole this is all about, which is how the first version
+                    # of this filled offset 0 with what it was testing for.
+                    fh.write(bytes([1 + start % 250]) * (end - start + 1))
+        parallel.write_spans(dest, spans)
+        return dest
+
+    total = 1000
+
+    # Spans out of order and with a hole: only the run from 0 is reachable.
+    dest = make("holed.bin", total, [(400, 499), (0, 199), (200, 299), (600, 699)],
+                fill=[(0, 299), (400, 499), (600, 699)])
+    checks.check("compact: the run from byte 0 is what is kept",
+                 parallel.compact_prefix(dest) == 300, "wrong prefix")
+    checks.check("compact: the file is cut to exactly that prefix",
+                 dest.stat().st_size == 300, str(dest.stat().st_size))
+    checks.check("compact: the sidecar goes, so nothing claims bytes past it",
+                 not parallel.spans_file(dest).exists())
+    # The kept bytes must still be the bytes that were there, not zeros.
+    with open(dest, "rb") as fh:
+        head = fh.read(8)
+    checks.check("compact: the bytes kept are the real ones, not holes",
+                 head and len(set(head)) == 1 and head[0] != 0, repr(head[:8]))
+
+    # No span starts at 0: nothing is reachable, so the caller must discard.
+    dest = make("nohead.bin", total, [(100, 199), (300, 399)], fill=[(100, 199)])
+    checks.check("compact: with nothing at byte 0 there is no prefix to keep",
+                 parallel.compact_prefix(dest) == 0, "kept something")
+    checks.check("compact: and it leaves the file for the caller to discard",
+                 dest.exists() and dest.stat().st_size == total)
+
+    # Adjacent and overlapping spans are one run, not several.
+    dest = make("adjacent.bin", total, [(0, 99), (100, 199), (150, 249)],
+                fill=[(0, 249)])
+    checks.check("compact: touching and overlapping spans count as one run",
+                 parallel.compact_prefix(dest) == 250, "wrong prefix")
+
+    # The whole file already done: nothing to cut.
+    dest = make("whole.bin", total, [(0, 999)], fill=[(0, 999)])
+    checks.check("compact: a complete file is left alone",
+                 parallel.compact_prefix(dest) == 1000
+                 and dest.stat().st_size == 1000)
+
+    # A sidecar that is not there at all must not invent a prefix.
+    dest = make("nosidecar.bin", total, [])
+    parallel.spans_file(dest).unlink(missing_ok=True)
+    checks.check("compact: no sidecar means no claim to anything",
+                 parallel.compact_prefix(dest) == 0)
+
+    # A resume asks for "from here to the end", which is not the same shape as
+    # a closed range. It used to send `bytes=300-0` -- end before start -- and
+    # a resumed download silently got an empty body and then called itself
+    # short. Cheap to pin down here rather than only through the fetch above.
+    checks.check("compact: a resume asks for bytes=from-there-to-the-end",
+                 parallel.Span(300).header == "bytes=300-",
+                 parallel.Span(300).header)
+    checks.check("compact: a closed range still names its end",
+                 parallel.Span(0, 0).header == "bytes=0-0"
+                 and parallel.Span(10, 20).header == "bytes=10-20"
+                 and parallel.Span(10, 20).length == 11,
+                 parallel.Span(10, 20).header)
+    checks.check("compact: an open-ended range admits it has no length",
+                 _raises(lambda: parallel.Span(300).length),
+                 "length did not complain")
+
+    # The point of the whole thing: after compacting, fetch_single resumes from
+    # the prefix rather than starting again. Checked against the real test
+    # server, over real HTTP, because "it resumed" has to mean a Range header
+    # and a stubbed urlopen cannot produce one.
+    from testserver import Server
+
+    served = b"\x41" * 300 + b"\x00" * 700
+    httpd = Server(payload=served)
+    try:
+        resumed = tmp / "resumed.bin"
+        with open(resumed, "wb") as fh:
+            fh.truncate(total)                 # preallocated, holes to the end
+        with open(resumed, "r+b") as fh:
+            fh.write(b"\x41" * 300)            # one good span at the front
+        parallel.write_spans(resumed, [(0, 299)])
+
+        kept = parallel.compact_prefix(resumed)
+        checks.check("compact: the prefix survives the handover",
+                     kept == 300 and resumed.stat().st_size == 300,
+                     f"kept={kept}")
+
+        hits_before = httpd.hits
+        got = parallel.fetch_single(httpd.url, resumed, expect=total, timeout=20)
+        checks.check("compact: the single connection finished the file",
+                     got == total, str(got))
+        checks.check("compact: and it was one ranged request, not the whole file",
+                     httpd.hits - hits_before == 1,
+                     f"{httpd.hits - hits_before} requests")
+        with open(resumed, "rb") as fh:
+            data = fh.read()
+        checks.check("compact: the result is the served bytes, in order",
+                     data == served, f"{len(data)} bytes, "
+                     f"head={data[:4]!r} tail={data[-4:]!r}")
+    finally:
+        httpd.close()
+
+
+def _span_retry_checks(checks) -> None:
+    """A throttled span is retried on its own, and the rest keeps going.
+
+    This is the measured failure. A 16-connection run against the real host was
+    answered 429 at 62% of 271 MB, and because every span shared one pool the
+    first exception took the whole download down, discarded 169 MB of good
+    data, and restarted on a single connection: 701s against 180s.
+
+    What the other download managers do instead is treat a 429 as a transient
+    error on the one connection it happened to, retry it from wherever that
+    span got to, and spend a budget that only counts attempts which produced
+    nothing. Read out of the AB Download Manager source: it has no 429 handling
+    and no adaptive concurrency at all, its thread count is a flat 8, and what
+    it actually relies on is `tries` resetting the instant a byte lands.
+    """
+    import parallel
+    from testserver import Server
+
+    tmp = Path(tempfile.mkdtemp(prefix="uc-retry-"))
+    try:
+        _span_retry_body(checks, tmp, parallel, Server)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _span_retry_body(checks, tmp: Path, parallel, Server) -> None:
+    import threading
+
+    # -- backoff, because a flat wait is wrong for a time-window limiter ---
+    # Ten one-second waits is ten seconds of patience, and this host's window
+    # is longer: the 429s kept coming and every retry landed inside the penalty.
+    schedule = [parallel.retry_delay(n) for n in range(1, 9)]
+    checks.check("retry: the wait doubles after each silent failure",
+                 schedule[:4] == [1.0, 2.0, 4.0, 8.0], str(schedule[:4]))
+    checks.check("retry: and then it stops growing, so giving up stays a "
+                 "decision somebody made",
+                 schedule[-1] == parallel.SPAN_RETRY_MAX_DELAY
+                 and schedule == sorted(schedule), str(schedule))
+    whole = sum(parallel.retry_delay(n)
+                for n in range(1, parallel.SPAN_MAX_TRIES + 1))
+    checks.check("retry: a run that never recovers is waited out for minutes, "
+                 "not seconds", whole > 60, f"{whole:.0f}s")
+
+    # The real schedule waits out a rate-limit window, which is minutes. That is
+    # right for the host and far too slow for a test suite, so what follows
+    # runs with it shrunk; the shape is what is being checked there, not the pace.
+    real_delay, real_max = parallel.SPAN_RETRY_DELAY, parallel.SPAN_RETRY_MAX_DELAY
+    parallel.SPAN_RETRY_DELAY = 0.01
+    parallel.SPAN_RETRY_MAX_DELAY = 0.05
+    try:
+        _span_retry_scenarios(checks, tmp, parallel, Server, threading)
+    finally:
+        parallel.SPAN_RETRY_DELAY, parallel.SPAN_RETRY_MAX_DELAY = real_delay, real_max
+
+
+def _span_retry_scenarios(checks, tmp: Path, parallel, Server, threading) -> None:
+    payload = bytes(range(256)) * 16          # 4096 bytes, each byte distinct
+    total = len(payload)
+    quarter = total // 4
+
+    # -- a throttled span is retried, and the rest keeps going:
+    # The first span gets two 429s and then is served normally. Before this
+    # change that first 429 failed the entire download.
+    flaky = Server(payload=payload, flaky={0: 2})
+    try:
+        dest = tmp / "flaky.bin"
+        got = parallel.fetch_parallel(flaky.url, dest, total, connections=4,
+                                      timeout=20)
+        checks.check("retry: a throttled span is retried, not fatal",
+                     got == total, f"got {got} of {total}")
+        checks.check("retry: and the finished file is byte-for-byte right",
+                     dest.read_bytes() == payload,
+                     f"{dest.stat().st_size} bytes")
+        starts = [s for s, _ in flaky.asked]
+        checks.check("retry: the throttled span was asked for three times",
+                     starts.count(0) == 3, f"asked at 0: {starts.count(0)}")
+        checks.check("retry: the other spans were each asked once, not re-run",
+                     all(starts.count(s) == 1
+                         for s in {quarter, quarter * 2, quarter * 3}),
+                     str(sorted(starts)))
+    finally:
+        flaky.close()
+
+    # -- a span that never gets a byte eventually gives up ---------------
+    # Ten consecutive silent failures is a host that is not serving this slice.
+    # It has to fail rather than wait for ever.
+    dead = Server(payload=payload, flaky={0: 999})
+    try:
+        dest = tmp / "dead.bin"
+        try:
+            parallel.fetch_parallel(dead.url, dest, total, connections=4,
+                                   timeout=20)
+            failed = False
+        except (OSError, parallel.DownloadCancelled):
+            failed = True
+        except Exception:
+            failed = True
+        checks.check("retry: a span that never moves gives up instead of "
+                     "looping for ever", failed, "it reported success")
+        # Only the throttled span's own requests: the other three each make one
+        # and succeed, so counting the whole server understates nothing and
+        # overstates the budget.
+        throttled = [s for s, _ in dead.asked if s == 0]
+        checks.check("retry: and it stops at the budget, not far past it",
+                     len(throttled) == parallel.SPAN_MAX_TRIES + 1,
+                     f"{len(throttled)} attempts")
+    finally:
+        dead.close()
+
+    # -- progress forgives the budget ------------------------------------
+    # The counter is there to catch a host that is not serving, not to cap the
+    # number of hiccups in a long healthy download. Each attempt hands back
+    # some bytes and is then cut short, so tries must never accumulate.
+    partial = Server(payload=payload, shorten={0: quarter // 2})
+    try:
+        dest = tmp / "partial.bin"
+        got = parallel.fetch_parallel(partial.url, dest, total, connections=1,
+                                      timeout=20)
+        checks.check("retry: repeated short reads still finish, because each "
+                     "one made progress", got == total, f"got {got}")
+        checks.check("retry: and the file is correct after all of them",
+                     dest.read_bytes() == payload)
+        # It must have resumed, not restarted: the offsets asked for walk
+        # forward from 0 instead of always being 0.
+        starts = sorted({s for s, _ in partial.asked})
+        checks.check("retry: the retry asked only for what was missing",
+                     len(starts) > 1 and starts[0] == 0
+                     and all(b > a for a, b in zip(starts, starts[1:])),
+                     str(starts[:8]))
+    finally:
+        partial.close()
+
+    # -- a stop is honoured during the retry pause -----------------------
+    slow = Server(payload=payload, flaky={0: 999})
+    try:
+        dest = tmp / "cancel.bin"
+        flag = threading.Event()
+
+        def cancelling() -> bool:
+            return flag.is_set()
+
+        threading.Timer(0.05, flag.set).start()
+        began = time.time()
+        try:
+            parallel.fetch_parallel(slow.url, dest, total, connections=4,
+                                    timeout=20, cancel=cancelling)
+            outcome = "finished"
+        except parallel.DownloadCancelled:
+            outcome = "cancelled"
+        except Exception:
+            outcome = "other"
+        took = time.time() - began
+        budget = sum(parallel.retry_delay(n)
+                     for n in range(1, parallel.SPAN_MAX_TRIES + 1))
+        checks.check("retry: a stop during a retry pause is honoured",
+                     outcome == "cancelled", outcome)
+        checks.check("retry: and it stops early, not after the budget is spent",
+                     took < budget / 2, f"{took:.2f}s of a {budget:.2f}s budget")
+    finally:
+        slow.close()
+
+    # -- a host that ignores ranges is still not a throttle --------------
+    # That one has to reach the caller, because the parallel premise is void
+    # and the right answer is to come down to one connection. Retrying it
+    # would just burn the budget discovering the same thing ten times.
+    blind = Server(payload=payload, honour_ranges=False)
+    try:
+        dest = tmp / "blind.bin"
+        try:
+            parallel.fetch_parallel(blind.url, dest, total, connections=4,
+                                   timeout=20)
+            outcome = "finished"
+        except parallel.RangeUnsupported:
+            outcome = "range-unsupported"
+        checks.check("retry: a host that ignores ranges is reported at once, "
+                     "not retried", outcome == "range-unsupported", outcome)
+        checks.check("retry: and it was not asked ten times first",
+                     len(blind.asked) <= 4, f"{len(blind.asked)} requests")
+    finally:
+        blind.close()
+
+
+    # -- the fallback is not a soft spot ---------------------------------
+    # A rate-limited parallel run lands here, so this path has to survive a 429
+    # as well. It did not: it made exactly one request, and the run died on the
+    # first try having already spent ten rounds retrying sixteen spans.
+    single = Server(payload=payload, flaky={0: 3})
+    try:
+        dest = tmp / "single.bin"
+        got = parallel.fetch_single(single.url, dest, expect=total, timeout=20)
+        checks.check("retry: one connection also waits out a 429",
+                     got == total, f"got {got} of {total}")
+        checks.check("retry: and the file it leaves is correct",
+                     dest.read_bytes() == payload)
+    finally:
+        single.close()
+
+    # A 404 is not a throttle and must not be retried into a slow failure.
+    gone = Server(payload=payload)
+    gone.close()
+    try:
+        dest = tmp / "gone.bin"
+        try:
+            parallel.fetch_single("http://127.0.0.1:1/nothing",
+                                  dest, expect=total, timeout=2)
+            outcome = "no error"
+        except SystemExit as exc:
+            outcome = str(exc)
+        except Exception as exc:
+            outcome = f"{type(exc).__name__}: {exc}"
+        checks.check("retry: a refused connection reports rather than spins",
+                     "no error" not in outcome, outcome[:80])
+    finally:
+        pass
+
+
 def main() -> int:
     checks = Checks()
     run(checks)
@@ -1583,6 +1933,8 @@ def main() -> int:
     _lock_checks(checks)
     _web_route_checks(checks)
     _progress_bar_checks(checks)
+    _compaction_checks(checks)
+    _span_retry_checks(checks)
     total = checks.passed + checks.failed
     print(f"uc-archiver selftest: {checks.passed} passed, {checks.failed} failed")
     return 1 if checks.failed else 0
