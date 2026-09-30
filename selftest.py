@@ -480,7 +480,10 @@ def _resolver_checks(checks) -> None:
             # scrapling actually returns.
             return FakeResults([value])
 
-    def resolve_with(page, ref="xITbBs4Q6l"):
+    def resolve_with(page, ref="xITbBs4Q6l", after=None):
+        """Resolve against a fake page. `after` is what the next go returns."""
+        pages = [page] + ([after] if after is not None else [])
+
         class FakeSession:
             def __init__(self, **_kw):
                 pass
@@ -489,7 +492,7 @@ def _resolver_checks(checks) -> None:
             def __exit__(self, *a):
                 return False
             def fetch(self, url, timeout=None):
-                return page
+                return pages.pop(0) if len(pages) > 1 else pages[0]
         import scrapling.fetchers as real
         with mock.patch.object(real, "StealthySession", FakeSession):
             return uc.resolve_share(ref)
@@ -541,7 +544,7 @@ def _resolver_checks(checks) -> None:
                          False, "it returned instead of raising")
         except uc.ShareUnavailable as exc:
             checks.check("share: no link is a clear error, not a bad download",
-                         "no download link" in str(exc), str(exc))
+                         "download link" in str(exc), str(exc))
     finally:
         for key, value in (("UC_RESOLVE_TRIES", real_tries),
                            ("UC_RESOLVE_PAUSE", real_pause)):
@@ -549,6 +552,54 @@ def _resolver_checks(checks) -> None:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+    # The page can load perfectly and still have no link, because the anchor is
+    # there before the link is: it reads "Generating download link" with no href
+    # until the page's own POST comes back. That is an ordinary state to be
+    # caught in rather than a failure, so the page is read again -- inside the
+    # same browser session, so the Cloudflare clearance is still held.
+    checks.check("share: the page timeout is over the measured solve time",
+                 uc.PAGE_TIMEOUT_MS >= 300_000, str(uc.PAGE_TIMEOUT_MS))
+    checks.check("share: and it goes at the page more than once",
+                 uc.LINK_WAIT_TRIES >= 2, str(uc.LINK_WAIT_TRIES))
+
+    blank = FakePage("n", "1 MB", "")                 # loaded, no href yet
+    later = FakePage("n", "1 MB", "https://vikingfile.com/d/xyz/n.7z")
+    real_sleep, uc.time.sleep = uc.time.sleep, lambda _s: None
+    try:
+        got = resolve_with(blank, after=later)
+        checks.check("share: a page with no link yet is read again, and the "
+                     "second read has it",
+                     got.download_url.endswith("/d/xyz/n.7z"),
+                     got.download_url)
+    except uc.ShareUnavailable as exc:
+        checks.check("share: a page with no link yet is read again, and the "
+                     "second read has it", False, str(exc)[:90])
+    finally:
+        uc.time.sleep = real_sleep
+
+    # And if the id itself has moved with everything else, what we are after is
+    # still a /d/ path -- so any anchor carrying one will do.
+    class MovedIds:
+        """The id has moved: #download-link returns nothing, but a /d/ anchor
+        is still on the page."""
+
+        def css(self, sel):
+            if sel == "a":
+                return [type("A", (), {"attrib": {
+                    "href": "https://vik1ngfile.site/d/abc/Game.7z"}})()]
+            if "attr(href)" in sel:
+                return FakeResults([])
+            return FakeResults(["Game - UC.7z"])
+
+    found = uc._share_or_none(MovedIds(), "https://vik1ngfile.site/f/x")
+    checks.check("share: a /d/ link is found even when the id has moved",
+                 found is not None and "/d/abc/" in found.download_url,
+                 found.download_url if found else "none")
+    checks.check("share: no link anywhere returns nothing rather than raising",
+                 uc._share_or_none(FakePage("n", "1 MB", ""),
+                                   "https://vikingfile.com/f/x") is None,
+                 "it raised")
 
     problem = uc.scrapling_problem()
     checks.check("share: a missing scrapling is reported as an install step",

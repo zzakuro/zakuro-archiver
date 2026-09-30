@@ -416,6 +416,20 @@ class ShareUnavailable(RuntimeError):
     """The page loaded but no link turned up."""
 
 
+# How long to let the page load for, in milliseconds.
+#
+# It was 90 seconds, which is under what the challenge actually takes on a slow
+# machine: one measured solve ran 91 seconds by itself, so the page was being
+# cut off at almost exactly the moment it succeeded. UC_PAGE_TIMEOUT changes it.
+PAGE_TIMEOUT_MS = 300_000
+
+# How many goes at the page before calling it a failure, and how long between
+# them. Each re-run happens inside the same browser session, so the Cloudflare
+# clearance is still held and the page has a token to work with.
+LINK_WAIT_TRIES = 4
+LINK_WAIT_SECONDS = 4.0
+
+
 def scrapling_problem() -> str | None:
     """Why the browser cannot be used, or None when it can."""
     try:
@@ -431,7 +445,7 @@ def scrapling_problem() -> str | None:
 
 
 def resolve_share(url_or_hash: str, headed: bool = False,
-                  timeout: int = 90_000, tries: int = 0,
+                  timeout: int = 0, tries: int = 0,
                   pause: float = 0.0) -> Share:
     """Scrape the share page for the link the download actually comes from.
 
@@ -445,7 +459,6 @@ def resolve_share(url_or_hash: str, headed: bool = False,
     So a plain HTTP GET of the page returns an anchor that is still `hidden`
     with no href, which looks exactly like the challenge having failed. The
     page has to be driven by a real browser and read *after* that POST lands.
-    Waiting for network idle is what makes the difference.
 
     Scrapling's StealthySession does the solving and re-locates the selectors
     if the site moves them, which matters here: the host has already changed
@@ -456,6 +469,7 @@ def resolve_share(url_or_hash: str, headed: bool = False,
     if problem:
         raise ShareUnavailable(problem)
 
+    timeout = timeout or _env_int("UC_PAGE_TIMEOUT", PAGE_TIMEOUT_MS)
     page_url = FILE_URL.format(url_or_hash) if not url_or_hash.startswith("http") \
         else url_or_hash
     from scrapling.fetchers import StealthySession
@@ -476,8 +490,9 @@ def resolve_share(url_or_hash: str, headed: bool = False,
     last = ""
     for attempt in range(1, max(1, tries) + 1):
         try:
-            page = _open_share(StealthySession, page_url, headed, timeout)
-            return _share_from(page, page_url)
+            # _open_share already waits for the link, so it hands back the share
+            # rather than the page.
+            return _open_share(StealthySession, page_url, headed, timeout)
         except ShareUnavailable as exc:
             last = str(exc)
             if attempt < tries:
@@ -489,12 +504,23 @@ def resolve_share(url_or_hash: str, headed: bool = False,
 
 
 def _open_share(session_cls, page_url: str, headed: bool, timeout: int):
-    """Load the page in a browser and return the parsed document.
+    """Load the page in a browser and read the download link out of it.
 
     Kept separate from the parsing so the logger handling cannot wrap it: a
     `return` inside a `finally` swallows whatever exception was in flight, and
     if the fetch fails there is no page to read, so the handler would fail
     again on an unbound name and hide the real error behind a NameError.
+
+    The re-fetch loop is the fix for something this got wrong for a long time.
+    `network_idle=True` waits for the network to go quiet -- and a share page
+    waiting on Cloudflare is quiet. Nothing is in flight at the moment the
+    challenge clears, so the fetch returns *before* the page's own
+    `cloudflareCallback` POST has even been sent, and the anchor reads "no
+    href, Generating download link". On a fast machine the generation wins that
+    race; on a slower one it does not, and every attempt reports the link did
+    not come out. Re-fetching inside the same session keeps the Cloudflare
+    clearance and re-runs the page's own script, which by then has a token to
+    work with.
     """
     import logging
 
@@ -510,9 +536,35 @@ def _open_share(session_cls, page_url: str, headed: bool, timeout: int):
         # clearance is a confusing failure much later on.
         with session_cls(headless=not headed, solve_cloudflare=True,
                          network_idle=True) as session:
-            return session.fetch(page_url, timeout=timeout)
+            page = session.fetch(page_url, timeout=timeout)
+            for attempt in range(LINK_WAIT_TRIES):
+                share = _share_or_none(page, page_url)
+                if share is not None:
+                    return share
+                if attempt + 1 < LINK_WAIT_TRIES:
+                    time.sleep(LINK_WAIT_SECONDS)
+                    page = session.fetch(page_url, timeout=timeout)
+            raise ShareUnavailable(
+                f"the page loaded but never produced a download link -- it is "
+                f"still saying \"Generating download link\" after "
+                f"{LINK_WAIT_TRIES} goes at it. Cloudflare cleared but the "
+                f"link did not follow. Try again, or run with --headed."
+            )
     finally:
         noisy.setLevel(previous)
+
+
+def _share_or_none(page, page_url: str) -> Share | None:
+    """Read the share page, or None when the link is not there yet.
+
+    The anchor is on the page before the link is: it reads "Generating download
+    link" with no href until the page's own POST comes back. So "no link" is a
+    normal intermediate state, not an error, and the caller gets to look again.
+    """
+    try:
+        return _share_from(page, page_url)
+    except ShareUnavailable:
+        return None
 
 
 def _share_from(page, page_url: str) -> Share:
@@ -534,6 +586,17 @@ def _share_from(page, page_url: str) -> Share:
                       text("title::text"), flags=re.I).strip()
     if not size_text:
         size_text = text("#file-information p::text")
+    if not href:
+        # Second chance before giving up: the id may have moved with everything
+        # else, and what we are after is a /d/ path anywhere on the page.
+        for anchor in page.css("a"):
+            try:
+                candidate = (anchor.attrib.get("href") or "").strip()
+            except Exception:
+                continue
+            if "/d/" in candidate:
+                href = candidate
+                break
     if not href:
         raise ShareUnavailable(
             "the page gave no download link. The Cloudflare challenge may "
