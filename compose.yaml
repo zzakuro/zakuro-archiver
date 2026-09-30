@@ -19,6 +19,11 @@ services:
     volumes:
       - ./catalogue.json:/work/catalogue.json:ro
       - ./out:/work/out
+      # The standard set. Put the redist folder beside this file as ./redist
+      # (~190MB of Microsoft and third party installers, which is why it is not
+      # in the repository) and the readme as ./ReadME.txt.
+      - ./redist:/work/redist:ro
+      - ./ReadME.txt:/work/ReadME.txt:ro
       # Downloads and unpacked folders are big and throwaway; keep them off the
       # writable layer so they can be a different volume or a tmpfs.
       - work:/work/tmp
@@ -33,6 +38,13 @@ services:
       # run together, because the host's limit is per IP.
       UC_CONNECTIONS: "8"
       UC_TOTAL_CONNECTIONS: "8"
+      # The standard set every release carries: the runtime installers as
+      # ~Common Redist/, and the readme. Both default to absolute paths on one
+      # Windows machine and neither exists here, so point them at the mounts
+      # below. A missing one stops the run rather than quietly shipping a
+      # release with no installers in it, so these two have to be right.
+      UC_REDIST: "/work/redist"
+      UC_README: "/work/ReadME.txt"
       # rar is proprietary and not in the image. 7-Zip reads the .7z shares and
       # writes .7z output; mount a rar and point --archiver at it for .rar.
     command: ["--serve", "--port", "8073", "--work-dir", "/work/tmp",
