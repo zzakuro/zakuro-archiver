@@ -429,6 +429,14 @@ PAGE_TIMEOUT_MS = 300_000
 LINK_WAIT_TRIES = 4
 LINK_WAIT_SECONDS = 4.0
 
+# The selector the page has to reach before it counts as ready. It names the
+# anchor *with* an href, so it cannot match while the anchor is still empty --
+# which is the whole point: the page decides when it is ready, rather than this
+# guessing from a network that is idle for reasons of its own. It is
+# site-specific and settable, because the host renames its ids and a markup
+# change should degrade to "no link" rather than to nothing.
+LINK_HREF_SELECTOR = "#download-link[href]"
+
 
 def scrapling_problem() -> str | None:
     """Why the browser cannot be used, or None when it can."""
@@ -511,16 +519,22 @@ def _open_share(session_cls, page_url: str, headed: bool, timeout: int):
     if the fetch fails there is no page to read, so the handler would fail
     again on an unbound name and hide the real error behind a NameError.
 
-    The re-fetch loop is the fix for something this got wrong for a long time.
+    The wait is the fix for something this got wrong for a long time.
     `network_idle=True` waits for the network to go quiet -- and a share page
     waiting on Cloudflare is quiet. Nothing is in flight at the moment the
     challenge clears, so the fetch returns *before* the page's own
     `cloudflareCallback` POST has even been sent, and the anchor reads "no
     href, Generating download link". On a fast machine the generation wins that
     race; on a slower one it does not, and every attempt reports the link did
-    not come out. Re-fetching inside the same session keeps the Cloudflare
-    clearance and re-runs the page's own script, which by then has a token to
-    work with.
+    not come out.
+
+    So the fetch is asked to wait for the selector that only exists once the
+    link is there -- `#download-link[href]`, which cannot match while the
+    anchor is still empty. That is the page deciding when it is ready, rather
+    than this guessing from a network that is idle for reasons of its own.
+
+    Re-fetching is kept as a backstop for a wait that times out, inside the
+    same session so the Cloudflare clearance is still held.
     """
     import logging
 
@@ -536,14 +550,14 @@ def _open_share(session_cls, page_url: str, headed: bool, timeout: int):
         # clearance is a confusing failure much later on.
         with session_cls(headless=not headed, solve_cloudflare=True,
                          network_idle=True) as session:
-            page = session.fetch(page_url, timeout=timeout)
+            page = _fetch_waiting(session, page_url, timeout)
             for attempt in range(LINK_WAIT_TRIES):
                 share = _share_or_none(page, page_url)
                 if share is not None:
                     return share
                 if attempt + 1 < LINK_WAIT_TRIES:
                     time.sleep(LINK_WAIT_SECONDS)
-                    page = session.fetch(page_url, timeout=timeout)
+                    page = _fetch_waiting(session, page_url, timeout)
             raise ShareUnavailable(
                 f"the page loaded but never produced a download link -- it is "
                 f"still saying \"Generating download link\" after "
@@ -552,6 +566,32 @@ def _open_share(session_cls, page_url: str, headed: bool, timeout: int):
             )
     finally:
         noisy.setLevel(previous)
+
+
+def _fetch_waiting(session, page_url: str, timeout: int):
+    """Fetch the page, waiting for the download link rather than for quiet.
+
+    The wait is what makes this reliable, and it is skippable because the
+    selector is site-specific: if the host renames the id, the wait times out
+    and the plain fetch still gets us the name and size, so a markup change
+    degrades to "no link" rather than to nothing.
+    """
+    selector = os.environ.get("UC_LINK_SELECTOR", LINK_HREF_SELECTOR).strip()
+    if selector:
+        try:
+            return session.fetch(page_url, timeout=timeout,
+                                 wait_selector=selector,
+                                 wait_selector_state="attached")
+        except TypeError:
+            pass                    # an older scrapling without the option
+        except Exception:
+            # A timeout here means the link never appeared, which the caller's
+            # own retry loop handles -- with the page in hand either way.
+            try:
+                return session.fetch(page_url, timeout=timeout)
+            except Exception:
+                raise
+    return session.fetch(page_url, timeout=timeout)
 
 
 def _share_or_none(page, page_url: str) -> Share | None:
