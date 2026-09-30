@@ -79,16 +79,35 @@ jobs:
       # A pushed image that cannot start is worse than no image, and the two
       # things that fail silently here are the browser (the whole tool rests on
       # it) and the healthcheck. So it is run, not assumed.
+      #
+      # The container is found by service rather than by name: compose derives
+      # the project name from the directory, so a hardcoded
+      # `<project>-uc-archiver-1` is a guess that is wrong on any runner whose
+      # checkout directory is not named after the service.
       - name: it starts, and the browser is there
+        env:
+          # compose refuses to start without this, and the point is to prove the
+          # page comes up, not that this token is any good.
+          UC_TOKEN: ci-smoke-test-not-a-real-token
         run: |
+          # compose bind-mounts a catalogue, a redist folder and a readme, and
+          # none of them is in the repository. Docker would create the missing
+          # ones as *directories*, which is not what a file mount should be, so
+          # stand-ins are made first. Nothing reads them here -- the point is
+          # that the container starts and the browser works.
+          mkdir -p redist out
+          : > ReadME.txt
+          printf '{"name": "ci", "downloads": []}' > catalogue.json
           docker compose up -d
+          cid=$(docker compose ps -q uc-archiver)
           for i in $(seq 1 30); do
-            state=$(docker inspect --format '{{.State.Health.Status}}' \
-                    uc-archiver-uc-archiver-1 2>/dev/null || echo starting)
+            state=$(docker inspect --format '{{.State.Health.Status}}' "$cid" 2>/dev/null || echo starting)
             [ "$state" = healthy ] && break
             [ "$state" = unhealthy ] && docker compose logs && exit 1
             sleep 10
           done
+          [ "$(docker inspect --format '{{.State.Health.Status}}' "$cid")" = healthy ] \
+            || { docker compose logs; exit 1; }
           docker compose exec -T uc-archiver python -c \
             "import sys, uc_archiver as u; sys.exit(1 if u.scrapling_problem() else 0)"
           docker compose down
