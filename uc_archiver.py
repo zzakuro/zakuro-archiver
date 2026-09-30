@@ -418,15 +418,21 @@ class ShareUnavailable(RuntimeError):
 
 # How long to let the page load for, in milliseconds.
 #
-# It was 90 seconds, which is under what the challenge actually takes on a slow
-# machine: one measured solve ran 91 seconds by itself, so the page was being
-# cut off at almost exactly the moment it succeeded. UC_PAGE_TIMEOUT changes it.
-PAGE_TIMEOUT_MS = 300_000
+# It was 90 seconds, which is under what the challenge takes on a slow machine:
+# one measured solve ran 91 seconds on its own, so the page was being cut off at
+# almost exactly the moment it succeeded. It is two minutes now, which clears a
+# slow solve with room over. UC_PAGE_TIMEOUT changes it.
+#
+# This multiplies: a page load, times the goes at it below, times the attempts
+# in resolve_share. Three hundred seconds with four goes was over an hour of
+# waiting on a single entry before it admitted defeat, which is not patience,
+# it is a hung run with a progress line.
+PAGE_TIMEOUT_MS = 120_000
 
 # How many goes at the page before calling it a failure, and how long between
 # them. Each re-run happens inside the same browser session, so the Cloudflare
 # clearance is still held and the page has a token to work with.
-LINK_WAIT_TRIES = 4
+LINK_WAIT_TRIES = 2
 LINK_WAIT_SECONDS = 4.0
 
 # The selector the page has to reach before it counts as ready. It names the
@@ -569,28 +575,15 @@ def _open_share(session_cls, page_url: str, headed: bool, timeout: int):
 
 
 def _fetch_waiting(session, page_url: str, timeout: int):
-    """Fetch the page, waiting for the download link rather than for quiet.
+    """Fetch the page and hand back what it says.
 
-    The wait is what makes this reliable, and it is skippable because the
-    selector is site-specific: if the host renames the id, the wait times out
-    and the plain fetch still gets us the name and size, so a markup change
-    degrades to "no link" rather than to nothing.
+    There is a `wait_selector` on the fetch that looks like the obvious answer
+    -- wait for `#download-link[href]`, which cannot match while the anchor is
+    empty. It was tried and removed: it turned a machine that resolved a share
+    in seven seconds into one that sat for fifteen, because the wait costs its
+    full budget before falling back. Reading the page and asking again is what
+    works, and the caller's loop is what asks.
     """
-    selector = os.environ.get("UC_LINK_SELECTOR", LINK_HREF_SELECTOR).strip()
-    if selector:
-        try:
-            return session.fetch(page_url, timeout=timeout,
-                                 wait_selector=selector,
-                                 wait_selector_state="attached")
-        except TypeError:
-            pass                    # an older scrapling without the option
-        except Exception:
-            # A timeout here means the link never appeared, which the caller's
-            # own retry loop handles -- with the page in hand either way.
-            try:
-                return session.fetch(page_url, timeout=timeout)
-            except Exception:
-                raise
     return session.fetch(page_url, timeout=timeout)
 
 
@@ -1559,6 +1552,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--check", action="store_true",
                    help="ask the host about every entry and report which are gone")
 
+    # Resolving a link needs a browser that can clear the host's Cloudflare
+    # challenge, which not every machine manages. So it can be done once,
+    # somewhere that does, and handed over as a file: --dump-links writes it,
+    # --links reads it, and a run with --links never opens a browser at all.
+    p.add_argument("--dump-links", metavar="FILE",
+                   help="resolve every entry and write hash+url to FILE")
+    p.add_argument("--links", metavar="FILE",
+                   help="take download links from FILE instead of resolving them")
+
     g = p.add_argument_group("what to change")
     g.add_argument("--remove", action="append", metavar="PATTERN", default=None,
                    help="delete what matches, relative to the game folder "
@@ -1670,6 +1672,69 @@ def check_catalogue(cat: Catalogue, viking: Viking) -> int:
     return 0 if alive else 1
 
 
+def read_links(path: str | Path) -> dict[str, str]:
+    """hash -> download url, from a file written by --dump-links.
+
+    One `hash<TAB>url` per line. `#` starts a comment and blank lines are
+    skipped, so the file can be read by a person as well as by this.
+    """
+    out: dict[str, str] = {}
+    try:
+        text = Path(path).expanduser().read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SystemExit(f"cannot read the links file {path}: {exc}") from exc
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t") if "\t" in line else line.split(None, 1)
+        if len(parts) != 2 or not parts[1].strip():
+            continue
+        out[parts[0].strip()] = parts[1].strip()
+    if not out:
+        raise SystemExit(f"{path} has no links in it")
+    return out
+
+
+def dump_links(cat, out_path: str | Path, headed: bool, entries=None) -> int:
+    """Resolve every entry and write hash+url. Returns how many failed.
+
+    A machine that can clear the challenge does this once; the file is a few
+    KB and any machine can then run the rest of the pipeline from it. Entries
+    that will not resolve are reported and skipped rather than stopping the
+    rest, because a catalogue of two hundred and sixty will always have a few
+    the host has taken down.
+
+    No timeout is passed through: the page wants milliseconds and --timeout is
+    the per-request one in seconds, so handing it over directly turns a
+    ninety-second page into ninety milliseconds and the browser dies on the
+    first navigation.
+    """
+    target = Path(out_path).expanduser()
+    rows = list(entries if entries is not None else cat.entries)
+    done, failed = 0, []
+    lines = ["# uc-archiver resolved links. hash<TAB>download url",
+             "# made by --dump-links; read back with --links"]
+    try:
+        for entry in rows:
+            try:
+                share = resolve_share(entry.hash, headed=headed)
+            except ShareUnavailable as exc:
+                failed.append((entry, str(exc)))
+                warn(f"no link for {entry.index} {entry.title}: {exc}")
+                continue
+            lines.append(f"{entry.hash}\t{share.download_url}")
+            done += 1
+            say(f"  {done:>4}/{len(rows)}  {entry.title[:48]}")
+    finally:
+        target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    say(f"wrote {done} link(s) to {target}")
+    if failed:
+        warn(f"{len(failed)} of {len(rows)} would not resolve; "
+             f"they are simply absent from the file")
+    return len(failed)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.serve:
@@ -1696,6 +1761,30 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check:
         return check_catalogue(cat, Viking(timeout=args.timeout))
+
+    if args.dump_links:
+        # Honours --pick / --match, so a handful can be resolved and checked
+        # before committing to the whole catalogue.
+        wanted = cat.entries
+        if args.pick:
+            one = cat.by_index(args.pick)
+            if one is None:
+                raise SystemExit(f"no entry numbered {args.pick} "
+                                 f"(1-{len(cat.entries)})")
+            wanted = [one]
+        elif args.match:
+            wanted = cat.find(args.match)
+            if not wanted:
+                raise SystemExit(f"nothing matches {args.match!r}")
+        return 1 if dump_links(cat, args.dump_links, args.headed,
+                                wanted) else 0
+
+    # Resolved links handed over from elsewhere. Read once, before any work, so
+    # an unreadable file stops the run here rather than two hundred entries in.
+    handed_over = read_links(args.links) if args.links else {}
+    if args.links:
+        say(f"using {len(handed_over)} resolved link(s) from {args.links}; "
+            f"no browser will be started")
 
     base = Path(args.profile_dir).expanduser() if args.profile_dir else default_profile_dir()
     profile, prof_path = resolve_settings(args, cat, base)
@@ -1783,11 +1872,25 @@ def main(argv: list[str] | None = None) -> int:
     # after that page's Cloudflare challenge is solved, so this is where the
     # browser is needed. The page's figures win over the API's where they
     # differ: it is the thing the download will actually be measured against.
-    step("resolving the download link")
-    try:
-        share = resolve_share(entry.hash, headed=args.headed)
-    except ShareUnavailable as exc:
-        raise SystemExit(f"could not resolve a download link: {exc}")
+    #
+    # Unless it was handed over. The name and size come from the API above, so
+    # a resolved url on its own is the whole of what is missing -- which means
+    # a run with --links needs no browser at all, and can happen anywhere.
+    if entry.hash in handed_over:
+        step("taking the link from the file")
+        share = Share(page_url=FILE_URL.format(entry.hash),
+                      name=remote_name or "download.bin",
+                      size=remote_size,
+                      download_url=handed_over[entry.hash])
+    else:
+        if handed_over:
+            say(f"   {entry.hash} is not in the links file, so it has to be "
+                f"resolved here")
+        step("resolving the download link")
+        try:
+            share = resolve_share(entry.hash, headed=args.headed)
+        except ShareUnavailable as exc:
+            raise SystemExit(f"could not resolve a download link: {exc}")
     say(f"   {share.name}  {human(share.size)}")
     # Only mention it when the difference is real. These two routinely differ
     # by a handful of bytes, and a warning that says 3.1 MB and 3.1 MB is worse

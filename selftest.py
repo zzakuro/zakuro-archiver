@@ -558,8 +558,11 @@ def _resolver_checks(checks) -> None:
     # until the page's own POST comes back. That is an ordinary state to be
     # caught in rather than a failure, so the page is read again -- inside the
     # same browser session, so the Cloudflare clearance is still held.
-    checks.check("share: the page timeout is over the measured solve time",
-                 uc.PAGE_TIMEOUT_MS >= 300_000, str(uc.PAGE_TIMEOUT_MS))
+    checks.check("share: the page timeout clears the slowest measured solve",
+                 uc.PAGE_TIMEOUT_MS >= 91_000, str(uc.PAGE_TIMEOUT_MS))
+    checks.check("share: and the whole wait is minutes, not an hour",
+                 uc.PAGE_TIMEOUT_MS * uc.LINK_WAIT_TRIES <= 600_000,
+                 f"{uc.PAGE_TIMEOUT_MS * uc.LINK_WAIT_TRIES}ms per attempt")
     checks.check("share: and it goes at the page more than once",
                  uc.LINK_WAIT_TRIES >= 2, str(uc.LINK_WAIT_TRIES))
 
