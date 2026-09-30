@@ -1,0 +1,29 @@
+# Bytecode
+__pycache__/
+*.py[cod]
+
+# Finished archives, and the multi-gigabyte downloads and unpacked folders they
+# are built from. None of it belongs in a repository.
+out/
+work/
+*.download.*
+*.download.*.spans
+*.partial
+
+# The run lock. One is written per download in progress and is stale the moment
+# that download stops.
+*.lock
+
+# The catalogue. A JSON list of share links to repacked games, one per entry,
+# and it is deliberately not in the repository -- it is data, it changes, and it
+# is not ours. Put it beside this file to work from it.
+unioncrax.json
+
+# The runtime installers carried into every release as ~Common Redist/. Microsoft
+# and third party binaries, ~190MB. Point --redist or UC_REDIST somewhere
+# instead. Without it, a run now stops rather than quietly shipping a release
+# that has no installers in it.
+redist/
+
+# The bearer token for the page.
+.env

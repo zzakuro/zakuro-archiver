@@ -1185,11 +1185,19 @@ def retag_inner_folder(root: Path, wanted: str) -> tuple[str, str] | None:
 
 
 def add_files(root: Path, entries: list[str], dry_run: bool = False,
-              required: bool = True) -> list[str]:
+              standard: bool = False) -> list[str]:
     """Copy files and whole folders in, honouring `NAME=path`.
 
     A folder source is copied recursively, so pointing at a prepared
     `redist/` brings the lot rather than an empty shell.
+
+    A source that is not there stops the run, and this used to have a
+    `required=False` that made the standard set a warning instead. That is how
+    a release came out with no runtime installers and a success message: these
+    paths belong to one machine, and a folder that has moved was reported and
+    skipped. Not wanting the standard set is now expressed by not listing it --
+    `"default_add": []` -- rather than by a folder being missing, and those two
+    are not the same thing. `standard` only changes how the refusal reads.
     """
     placed: list[str] = []
     for entry in entries:
@@ -1199,14 +1207,12 @@ def add_files(root: Path, entries: list[str], dry_run: bool = False,
             if "=" in entry:
                 hint = ("  (if that was meant as NAME=path, the part after the "
                         "'=' does not exist)")
-            if not required:
-                # The standard set lives at absolute paths on one machine. If
-                # that folder has moved, say so and carry on: refusing to build
-                # a release because a Desktop is somewhere else would be a
-                # worse outcome than a release without a readme.
-                warn(f"standard file not there, skipped: {source}{hint}")
-                continue
-            raise SystemExit(f"--add: not found: {source}{hint}")
+            if standard:
+                hint += ("\n   This is part of every release. Point it "
+                         "somewhere that exists with UC_REDIST or UC_README, "
+                         "or set \"default_add\": [] if you do not want it.")
+            raise SystemExit(f"{'standard file' if standard else '--add'}: "
+                             f"not found: {source}{hint}")
         target = root / name if name else root / source.name
         if dry_run:
             placed.append(target.relative_to(root).as_posix())
@@ -1279,6 +1285,35 @@ DEFAULT_ADD = [
     r"C:\Users\Mfree\OneDrive\Desktop\~Common Redist",
     r"C:\Users\Mfree\OneDrive\Documents\zakuro-tool\ReadME.txt",
 ]
+
+# What the two above are called, and where they can be redirected to.
+#
+# Both are absolute paths on one machine, and both are baked into the image by
+# `COPY profiles/`. On a server neither exists, and a missing standard file used
+# to be a warning, so a release came out with no runtime installers and a
+# success message. Setting these points the same two things somewhere that does
+# exist -- a mount, a synced folder -- without editing the profile.
+REDIST_NAME = "~Common Redist"
+README_NAME = "ReadME.txt"
+
+
+def standard_add(configured: list[str]) -> list[str]:
+    """The standard set, with the two machine-specific paths redirected.
+
+    Matched by what an entry is *called* rather than by its position, so
+    reordering the list cannot point the redist at the readme.
+    """
+    redist = os.environ.get("UC_REDIST", "").strip()
+    readme = os.environ.get("UC_README", "").strip()
+    out = []
+    for entry in configured:
+        tail = re.split(r"[\\/]", entry.rstrip("\\/"))[-1]
+        if tail == REDIST_NAME and redist:
+            entry = redist
+        elif tail == README_NAME and readme:
+            entry = readme
+        out.append(entry)
+    return out
 
 
 @dataclass
@@ -1795,12 +1830,19 @@ def main(argv: list[str] | None = None) -> int:
     # file is not copied twice.
     asked = list(profile.add)
     already = {split_extra(a)[1] for a in asked}
-    standard = [e for e in profile.default_add if split_extra(e)[1] not in already]
+    standard = [e for e in standard_add(profile.default_add)
+                if split_extra(e)[1] not in already]
     if asked or standard:
         step("adding")
         for rel in add_files(unpack, asked):
             say(f"   + {rel}")
-        for rel in add_files(unpack, standard, required=False):
+        # Required, so a standard file that is configured but not there stops
+        # the run. It used to be a warning, on the grounds that these paths
+        # belong to one machine and that folder moves -- which is true, and
+        # which is exactly how a release ships with no runtime installers and
+        # reports success. `default_add: []` is the way to not want them, and
+        # an empty list never gets here, so the two are not confused.
+        for rel in add_files(unpack, standard, standard=True):
             say(f"   + {rel}")
 
     # -- repack ---------------------------------------------------------

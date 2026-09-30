@@ -11,6 +11,7 @@ edits, and naming the output once rather than twice.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -523,13 +524,30 @@ def _resolver_checks(checks) -> None:
         checks.check("share: and the page url is kept for the Referer",
                      got.page_url == page_url, got.page_url)
 
+    # No link is a clear error, and getting there means sitting out the whole
+    # retry budget. Five tries with a pause that grows is over a hundred
+    # seconds of real sleeping, which is right for a host and far too slow for
+    # a test suite, so both are shrunk here and the schedule is checked above
+    # rather than endured.
+    real_tries = os.environ.get("UC_RESOLVE_TRIES")
+    real_pause = os.environ.get("UC_RESOLVE_PAUSE")
+    os.environ["UC_RESOLVE_TRIES"] = "2"
+    os.environ["UC_RESOLVE_PAUSE"] = "0.01"
     try:
-        resolve_with(FakePage("n", "1 MB", ""))
-        checks.check("share: no link is a clear error, not a bad download",
-                     False, "it returned instead of raising")
-    except uc.ShareUnavailable as exc:
-        checks.check("share: no link is a clear error, not a bad download",
-                     "no download link" in str(exc), str(exc))
+        try:
+            resolve_with(FakePage("n", "1 MB", ""))
+            checks.check("share: no link is a clear error, not a bad download",
+                         False, "it returned instead of raising")
+        except uc.ShareUnavailable as exc:
+            checks.check("share: no link is a clear error, not a bad download",
+                         "no download link" in str(exc), str(exc))
+    finally:
+        for key, value in (("UC_RESOLVE_TRIES", real_tries),
+                           ("UC_RESOLVE_PAUSE", real_pause)):
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
     problem = uc.scrapling_problem()
     checks.check("share: a missing scrapling is reported as an install step",
@@ -876,7 +894,7 @@ def _standard_add_checks(checks) -> None:
         for e in uc.DEFAULT_ADD:
             _name, src = uc.split_extra(e)
             if src.is_dir():
-                got = uc.add_files(work, [e], required=False)
+                got = uc.add_files(work, [e])
                 target = work / src.name
                 checks.check("standard add: the redist arrives as a folder of its own",
                              target.is_dir() and got == [src.name],
@@ -889,25 +907,59 @@ def _standard_add_checks(checks) -> None:
                              len(inside) > 1, f"{len(inside)} file(s)")
                 _shutil.rmtree(target, ignore_errors=True)
             else:
-                got = uc.add_files(work, [e], required=False)
+                got = uc.add_files(work, [e])
                 checks.check("standard add: the readme arrives as a file",
                              (work / src.name).is_file() and got == [src.name], str(got))
 
-        # A missing one warns and carries on.
+        # A missing entry stops the run, including the standard set. It used to
+        # be a warning for the standard set, which is how a release came out
+        # with no runtime installers and a success message.
         gone = work / "gone"
         try:
-            got = uc.add_files(work, [str(gone / "nope.txt")], required=False)
-            checks.check("standard add: a missing entry is skipped, not fatal",
-                         got == [], str(got))
-        except SystemExit as exc:
-            checks.check("standard add: a missing entry is skipped, not fatal",
-                         False, f"raised {exc}")
-        try:
             uc.add_files(work, [str(gone / "nope.txt")])
-            checks.check("add: an explicit missing path is still fatal", False,
+            checks.check("add: an explicit missing path is fatal", False,
                          "it did not raise")
         except SystemExit:
-            checks.check("add: an explicit missing path is still fatal", True)
+            checks.check("add: an explicit missing path is fatal", True)
+        try:
+            uc.add_files(work, [str(gone / "nope.txt")], standard=True)
+            checks.check("standard add: a missing entry is fatal too", False,
+                         "it did not raise")
+        except SystemExit as exc:
+            checks.check("standard add: a missing entry is fatal too", True)
+            checks.check("standard add: and the refusal says how to point it "
+                         "somewhere else",
+                         "UC_REDIST" in str(exc) or "UC_README" in str(exc),
+                         str(exc)[:90])
+
+        # The two machine-specific paths can be redirected, matched by what the
+        # entry is called rather than by its position -- so reordering the list
+        # cannot point the redist at the readme.
+        configured = [r"D:\Desktop\~Common Redist", r"D:\docs\ReadME.txt"]
+        real_env = {k: uc.os.environ.get(k) for k in ("UC_REDIST", "UC_README")}
+        try:
+            uc.os.environ.pop("UC_REDIST", None)
+            uc.os.environ.pop("UC_README", None)
+            checks.check("standard add: with nothing set, the profile stands",
+                         uc.standard_add(configured) == configured,
+                         str(uc.standard_add(configured)))
+            uc.os.environ["UC_REDIST"] = "/srv/redist"
+            uc.os.environ["UC_README"] = "/srv/ReadME.txt"
+            moved = uc.standard_add(configured)
+            checks.check("standard add: UC_REDIST and UC_README redirect them",
+                         moved == ["/srv/redist", "/srv/ReadME.txt"], str(moved))
+            uc.os.environ["UC_REDIST"] = "/srv/redist"
+            uc.os.environ.pop("UC_README")
+            only_one = uc.standard_add(configured)
+            checks.check("standard add: one redirect leaves the other alone",
+                         only_one == ["/srv/redist", r"D:\docs\ReadME.txt"],
+                         str(only_one))
+        finally:
+            for key, value in real_env.items():
+                if value is None:
+                    uc.os.environ.pop(key, None)
+                else:
+                    uc.os.environ[key] = value
     finally:
         _shutil.rmtree(work, ignore_errors=True)
 
