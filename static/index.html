@@ -77,6 +77,8 @@
   <span class="dim" id="status">connecting…</span>
   <span style="flex:1"></span>
   <button id="clear">Clear finished</button>
+  <button id="stopall">Stop all</button>
+  <button id="runall">Run everything</button>
   <button id="go" class="go" disabled>Run selected</button>
 </header>
 <main>
@@ -129,6 +131,7 @@ function when(sec) {
 }
 
 let selected = null;
+let everyIndex = [];          // every entry's number, for "run everything"
 const streams = new Map();
 
 async function loadStatus() {
@@ -151,6 +154,7 @@ async function loadEntries() {
     const cat = await api("/api/catalogue");
     if (cat.error) { box.replaceChildren(el("div", "empty", cat.error)); return; }
     box.replaceChildren();
+    everyIndex = cat.entries.map(e => e.index);
     for (const e of cat.entries) {
       const row = el("div", "row");
       row.append(el("div", "t", e.title), el("div", "n", e.declared_size_text || ""));
@@ -235,6 +239,33 @@ $("#go").onclick = async () => {
     renderJob(j); watch(j);
   } catch (e) { alert("could not start: " + e.message); }
   $("#go").disabled = false;
+};
+// The whole catalogue in one go. Every entry becomes a queued job and the
+// server runs a few at a time, because the host throttles per IP and each run
+// also wants room on the disk -- submitting all of them at once would have them
+// all competing for both. Each one still waits out a rate limit on its own.
+$("#runall").onclick = async () => {
+  const every = everyIndex.slice();
+  if (!every.length) return;
+  if (!confirm(`Queue all ${every.length} entries?\n\n`
+             + `They run a few at a time. A run that hits a rate limit waits and `
+             + `tries again rather than failing.`)) return;
+  $("#runall").disabled = true;
+  try {
+    const r = await api("/api/jobs", { method: "POST", body: JSON.stringify({ indices: every }) });
+    for (const j of r.jobs) { renderJob(j); if (j.cancellable) watch(j); }
+    poll();
+  } catch (e) { alert("could not start: " + e.message); }
+  $("#runall").disabled = false;
+};
+// Stops everything, which includes the ones still waiting for a slot -- they
+// leave the queue without ever running.
+$("#stopall").onclick = async () => {
+  if (!confirm("Stop every run, including the ones still waiting?")) return;
+  for (const j of jobs) {
+    try { await api("/api/jobs/" + j.id + "/cancel", { method: "POST" }); } catch (e) {}
+  }
+  poll();
 };
 $("#clear").onclick = async () => { await api("/api/jobs/clear", { method: "POST" }); poll(); };
 

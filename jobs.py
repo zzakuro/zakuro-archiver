@@ -36,6 +36,18 @@ DONE = "done"
 FAILED = "failed"
 CANCELLED = "cancelled"
 
+# How many runs may be in flight at once, unless told otherwise. Three is
+# deliberately small: the host throttles per IP, so a third connection-heavy
+# run is where it starts answering 429, and every run also wants room on the
+# disk for its download, its unpacked tree and its finished archive.
+DEFAULT_MAX_RUNNING = 3
+
+
+def _env_int(name: str, default: int) -> int:
+    import os
+    raw = os.environ.get(name, "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else default
+
 # How much log a job keeps. A long download redraws a progress line
 # constantly, and an unbounded log is a memory leak with a progress bar on it.
 MAX_LOG_LINES = 500
@@ -178,12 +190,21 @@ class Job:
 
 
 class JobManager:
-    """Holds the jobs and runs them, one thread each."""
+    """Holds the jobs and runs them, a few at a time.
 
-    def __init__(self) -> None:
+    `max_running` is how many may be in flight together. The host throttles per
+    IP and the disk is finite, so a queue of everything at once would have every
+    entry competing for both: submissions beyond the cap wait their turn, and a
+    cancelled one leaves the queue without ever starting.
+    """
+
+    def __init__(self, max_running: int = 0) -> None:
         self._jobs: dict[str, Job] = {}
         self._order: list[str] = []
         self._lock = threading.Lock()
+        self.max_running = max(1, int(max_running or _env_int(
+            "UC_MAX_RUNNING", DEFAULT_MAX_RUNNING)))
+        self._slots = threading.Semaphore(self.max_running)
 
     def submit(self, index: int, title: str,
                work: Callable[[Job], str]) -> Job:
@@ -196,32 +217,52 @@ class JobManager:
         return job
 
     def _run(self, job: Job, work: Callable[[Job], str]) -> None:
-        job.state = RUNNING
-        job.started = time.time()
-        token = bind(job)
+        # Wait for a slot before doing anything at all, so a queue of two
+        # hundred is two hundred jobs in order rather than two hundred
+        # downloads, two hundred browsers and two hundred claims on the disk.
+        # Each job still waits out a rate limit on its own; this is about how
+        # many are in flight at once.
+        acquired = self._slots.acquire(timeout=0.2)
         try:
-            job.result = work(job) or ""
-            job.state = CANCELLED if job.cancelled else DONE
-        except JobCancelled:
-            job.state = CANCELLED
-            job.append("stopped")
-        except _downloader_cancelled():
-            # The downloader has its own stop exception, raised from a worker
-            # thread rather than from a phase boundary. It is the same event,
-            # so it has to land the same way -- as a stop, not a failure.
-            job.state = CANCELLED
-            job.append("stopped during the download")
-        except BaseException as exc:                      # noqa: BLE001
-            job.state = FAILED
-            job.error = f"{type(exc).__name__}: {exc}"
-            job.append(job.error)
-            # Kept in the log, not just in the message: the traceback is what
-            # makes a failure debuggable and a one-liner rarely is.
-            for line in traceback.format_exc().splitlines()[-8:]:
-                job.append("  " + line)
+            while not acquired:
+                if job.cancelled:
+                    job.state = CANCELLED
+                    job.append("stopped before it started")
+                    return
+                acquired = self._slots.acquire(timeout=0.2)
+            if job.cancelled:
+                job.state = CANCELLED
+                job.append("stopped before it started")
+                return
+            job.state = RUNNING
+            job.started = time.time()
+            token = bind(job)
+            try:
+                job.result = work(job) or ""
+                job.state = CANCELLED if job.cancelled else DONE
+            except JobCancelled:
+                job.state = CANCELLED
+                job.append("stopped")
+            except _downloader_cancelled():
+                # The downloader has its own stop exception, raised from a worker
+                # thread rather than from a phase boundary. It is the same event,
+                # so it has to land the same way -- as a stop, not a failure.
+                job.state = CANCELLED
+                job.append("stopped during the download")
+            except BaseException as exc:                  # noqa: BLE001
+                job.state = FAILED
+                job.error = f"{type(exc).__name__}: {exc}"
+                job.append(job.error)
+                # Kept in the log, not just in the message: the traceback is what
+                # makes a failure debuggable and a one-liner rarely is.
+                for line in traceback.format_exc().splitlines()[-8:]:
+                    job.append("  " + line)
+            finally:
+                job.finished = time.time()
+                unbind(token)
         finally:
-            job.finished = time.time()
-            unbind(token)
+            if acquired:
+                self._slots.release()
 
     def get(self, job_id: str) -> Job | None:
         with self._lock:

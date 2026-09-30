@@ -15,6 +15,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -2337,6 +2338,101 @@ def _span_retry_scenarios(checks, tmp: Path, parallel, Server, threading) -> Non
         pass
 
 
+def _queue_checks(checks) -> None:
+    """A whole catalogue queued, rather than the whole catalogue at once.
+
+    The manager started a thread per submission, so asking for two hundred
+    entries meant two hundred downloads, two hundred browsers and two hundred
+    claims on the disk, all competing for one IP that throttles. A run that
+    hits rate limiting still waits and retries on its own; this is only about
+    how many are in flight together.
+    """
+    import jobs as jobsmod
+
+    checks.check("queue: the default is a small number of runs at a time",
+                 jobsmod.DEFAULT_MAX_RUNNING == 3,
+                 str(jobsmod.DEFAULT_MAX_RUNNING))
+
+    q = jobsmod.JobManager(max_running=2)
+    live = {"now": 0, "peak": 0}
+    gate = threading.Event()
+
+    def slow(job):
+        with q._lock:
+            live["now"] += 1
+            live["peak"] = max(live["peak"], live["now"])
+        try:
+            gate.wait(10)
+        finally:
+            with q._lock:
+                live["now"] -= 1
+        return "done"
+
+    queued = [q.submit(i, f"job{i}", slow) for i in range(6)]
+    time.sleep(0.5)
+    checks.check("queue: six submissions do not all run at once",
+                 live["peak"] <= 2, f"peak {live['peak']}")
+    checks.check("queue: and four are waiting their turn",
+                 sum(1 for j in queued if j.state == jobsmod.QUEUED) == 4,
+                 str([j.state for j in queued]))
+    gate.set()
+    for _ in range(120):
+        if all(j.state in (jobsmod.DONE, jobsmod.FAILED, jobsmod.CANCELLED)
+               for j in queued):
+            break
+        time.sleep(0.05)
+    checks.check("queue: they all finish once the gate opens",
+                 all(j.state == jobsmod.DONE for j in queued),
+                 str([j.state for j in queued]))
+    checks.check("queue: and the cap was actually reached, or the test proves "
+                 "nothing", live["peak"] == 2, f"peak {live['peak']}")
+
+    # A job stopped while waiting must leave the queue without ever starting.
+    q2 = jobsmod.JobManager(max_running=1)
+    hold = threading.Event()
+    started = []
+
+    def blocked(job):
+        hold.wait(10)
+        return "done"
+
+    first = q2.submit(1, "blocker", blocked)
+    time.sleep(0.3)
+    waiting = q2.submit(2, "waiting", lambda j: started.append(j.index) or "done")
+    time.sleep(0.3)
+    checks.check("queue: the second is waiting, not running",
+                 waiting.state == jobsmod.QUEUED, waiting.state)
+    checks.check("queue: stop it while it waits", q2.cancel(waiting.id),
+                 "cancel refused")
+    hold.set()
+    time.sleep(0.6)
+    checks.check("queue: and it never started",
+                 waiting.state == jobsmod.CANCELLED and not started,
+                 f"{waiting.state}, started={started}")
+    q2.cancel(first.id)
+
+    # A run that fails must give its slot back, or a leaked one would shrink
+    # the queue for everything waiting behind it.
+    q3 = jobsmod.JobManager(max_running=1)
+
+    def boom(job):
+        raise ValueError("deliberate")
+
+    stopper = q3.submit(1, "boom", boom)
+    for _ in range(60):
+        if stopper.state in (jobsmod.DONE, jobsmod.FAILED):
+            break
+        time.sleep(0.05)
+    after = q3.submit(2, "after", lambda j: "ok")
+    for _ in range(60):
+        if after.state in (jobsmod.DONE, jobsmod.FAILED):
+            break
+        time.sleep(0.05)
+    checks.check("queue: a failed run gives its slot back",
+                 stopper.state == jobsmod.FAILED and after.state == jobsmod.DONE,
+                 f"{stopper.state} then {after.state}")
+
+
 def main() -> int:
     checks = Checks()
     run(checks)
@@ -2353,6 +2449,7 @@ def main() -> int:
     _inner_folder_checks(checks)
     _parallel_download_checks(checks)
     _job_checks(checks)
+    _queue_checks(checks)
     _lock_checks(checks)
     _web_route_checks(checks)
     _progress_bar_checks(checks)

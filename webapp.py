@@ -192,10 +192,25 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/jobs":
             body = self._body()
             try:
+                # One entry, or a list. A list is how a whole catalogue is
+                # started: every one becomes a queued job and the manager runs
+                # a few at a time, so submitting two hundred is two hundred
+                # jobs in order rather than two hundred downloads at once.
+                wanted = body.get("indices")
+                if isinstance(wanted, list) and wanted:
+                    started = [self.app.start(int(i), body.get("options") or {})
+                               .to_dict() for i in wanted]
+                    return self._json({
+                        "started": len(started),
+                        "max_running": self.app.jobs.max_running,
+                        "jobs": started,
+                    }, 202)
                 job = self.app.start(int(body.get("index", -1)),
                                      body.get("options") or {})
             except KeyError as exc:
                 return self._json({"error": str(exc)}, 400)
+            except (TypeError, ValueError) as exc:
+                return self._json({"error": f"not an entry number: {exc}"}, 400)
             except SystemExit as exc:
                 # The tool's own "stop with a message" path. BaseException, so
                 # an `except Exception` would miss it and the client would get
