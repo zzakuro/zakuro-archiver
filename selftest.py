@@ -1248,6 +1248,38 @@ def _job_checks(checks) -> None:
     dead.set_progress(30, 300)
     checks.check("job: a failed bar is not full",
                  dead.fraction < 0.99 and dead.fraction > 0.1, str(dead.fraction))
+
+    # A job's phase has to move. It did not: step() called checkpoint() for the
+    # stop check and never told the job what phase it was in, so a real run
+    # through the web interface reported "starting" from the first resolve to
+    # the finished archive. Found by driving a real job, not by a check.
+    walked = jobs.JobManager()
+    job3 = walked.submit(8, "walked", lambda j: "")
+    try:
+        previous_job = jobs.bind(job3)
+        uc.step("one")
+        uc.step("two")
+        uc.step("three")
+    finally:
+        jobs.unbind(previous_job)
+    checks.check("job: step() is what moves the phase",
+                 job3.phase == "three", job3.phase)
+    checks.check("job: and each phase is announced in the log exactly once",
+                 sum(1 for line in job3.log if line == "== two ==") == 1,
+                 str([line for line in job3.log if line.startswith("==")]))
+
+    # A checkpoint with no name must not clear the phase: something that only
+    # wants the stop check should not wipe what the bar is showing.
+    held = jobs.Job(id="h", index=9, title="t")
+    previous_job = jobs.bind(held)
+    try:
+        held.set_phase("downloading", announce=False)
+        jobs.checkpoint()
+        kept = held.phase
+    finally:
+        jobs.unbind(previous_job)
+    checks.check("job: a checkpoint with no name leaves the phase alone",
+                 kept == "downloading", kept)
     checks.check("job: a cancelled bar is not full either",
                  (setattr(dead, "state", jobs.CANCELLED),
                   dead.fraction < 0.99)[1], str(dead.fraction))
@@ -1772,6 +1804,52 @@ def _span_retry_scenarios(checks, tmp: Path, parallel, Server, threading) -> Non
     payload = bytes(range(256)) * 16          # 4096 bytes, each byte distinct
     total = len(payload)
     quarter = total // 4
+
+    # -- and two downloads really do share the one budget -----------------
+    # The claim is about overlap, so it is checked as overlap: two downloads,
+    # four connections each, one budget of four. Had the budget not bound, the
+    # two servers between them would have had eight requests open at once,
+    # which is the number that drew a 429 from the real host.
+    #
+    # The server stalls briefly so the two genuinely overlap. A local server
+    # otherwise answers faster than the client can ask, and the test would pass
+    # without ever having two downloads running at the same time -- which is
+    # the thing being claimed.
+    big = bytes(range(256)) * 256          # 64 KiB
+    one = Server(payload=big, stall=0.02)
+    two = Server(payload=big, stall=0.02)
+    previous = parallel.budget()
+    try:
+        parallel.set_budget(4)
+        results = []
+
+        def pull(server, name):
+            target = tmp / f"share-{name}.bin"
+            try:
+                results.append(parallel.fetch_parallel(
+                    server.url, target, len(big), connections=4, timeout=30))
+            except Exception as exc:
+                results.append(f"{type(exc).__name__}: {exc}")
+
+        threads = [threading.Thread(target=pull, args=(s, n), daemon=True)
+                   for s, n in ((one, "a"), (two, "b"))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        peak = one.peak_concurrency + two.peak_concurrency
+        checks.check("budget: both downloads finished while sharing it",
+                     sorted(results) == [len(big), len(big)], str(results))
+        checks.check("budget: and between them they never had more open than "
+                     "the budget", peak <= 4, f"{peak} open at once")
+        checks.check("budget: both really were in flight together, or the "
+                     "test proves nothing about sharing",
+                     one.peak_concurrency >= 1 and two.peak_concurrency >= 1,
+                     f"{one.peak_concurrency} and {two.peak_concurrency}")
+    finally:
+        parallel.set_budget(previous[1] or parallel.DEFAULT_CONNECTIONS)
+        one.close()
+        two.close()
 
     # -- one connection budget for the process, not one per download ------
     # The throttle is per IP, so ten downloads each taking eight connections

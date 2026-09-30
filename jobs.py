@@ -138,10 +138,11 @@ class Job:
 
     # -- reporting -----------------------------------------------------
 
-    def set_phase(self, name: str) -> None:
+    def set_phase(self, name: str, announce: bool = True) -> None:
         with self._lock:
             self.phase = name
-        self.append(f"== {name} ==")
+        if announce:
+            self.append(f"== {name} ==")
 
     def append(self, line: str) -> None:
         with self._lock:
@@ -280,11 +281,24 @@ def report(line: str) -> None:
         job.append(line)
 
 
-def checkpoint() -> None:
-    """Called at every phase boundary, to honour a stop request."""
+def checkpoint(phase: str = "") -> None:
+    """Called at every phase boundary, to honour a stop request.
+
+    Takes the phase name as well because step() is already the one place every
+    phase announces itself, and it was calling this for the stop check only.
+    So a job's phase was set once, to "starting", and never moved again: a real
+    run through the web interface reported "starting" from the first resolve to
+    the finished archive.
+    """
     job = current()
-    if job is not None:
-        job.checkpoint()
+    if job is None:
+        return
+    if phase:
+        # The pipeline announces the phase itself, one line later, so this only
+        # moves the field. Announcing here as well would put every phase in the
+        # job's log twice.
+        job.set_phase(phase, announce=False)
+    job.checkpoint()
 
 
 def _downloader_cancelled():

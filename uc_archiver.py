@@ -109,8 +109,12 @@ def step(msg: str) -> None:
     # Every phase begins with one of these, which makes it the one place a stop
     # request has to be honoured. Checking anywhere else means either missing a
     # phase or threading the check through every one of them.
+    #
+    # The name goes to the job as well, because this is the only place the
+    # pipeline says what phase it is in. Passing it only for the stop check left
+    # a job reading "starting" from the first resolve to the finished archive.
     import jobs
-    jobs.checkpoint()
+    jobs.checkpoint(msg)
     line = f"== {msg} =="
     jobs.report(line)
     parallel.clear_bar()
@@ -1590,7 +1594,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         step("dry run")
         say(f"   would wait for  {entry.hash}")
-        say(f"   would download to  {work_base / (stem + '.download' + ext)}")
+        # The extension cannot be known here and is not the archiver's. The
+        # real name comes from what the host calls the file, and that is only
+        # known once the page has been resolved -- which is the step a dry run
+        # exists to avoid. So it says so rather than naming a file that will
+        # not be there: it used to print `<stem>.download.rar` and produce
+        # `<stem>.download.7z`, and the extension is what decides which tool
+        # opens it.
+        say(f"   would download to  {work_base / (stem + '.download')}"
+            f"<the host's extension, once the page is resolved>")
         say(f"   would unpack     {stem}/")
         for pattern in profile.remove:
             say(f"   would remove     {pattern}")
