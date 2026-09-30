@@ -889,27 +889,46 @@ def _standard_add_checks(checks) -> None:
                  ).default_add == ["D:/only-this"])
 
     # The folder has to arrive as a folder, named the same, contents and all.
+    #
+    # Built here and pointed at with UC_REDIST / UC_README rather than read
+    # from the real DEFAULT_ADD. The defaults are absolute paths on one Windows
+    # machine, so a test that used them passed there and failed everywhere else
+    # -- which is what the first CI run did, with a missing-file error naming
+    # a Desktop it had never heard of. This way the redirection is what is
+    # being tested, and the test runs the same everywhere.
     work = _Path(tempfile.mkdtemp(prefix="uc-std-"))
     try:
-        for e in uc.DEFAULT_ADD:
-            _name, src = uc.split_extra(e)
-            if src.is_dir():
-                got = uc.add_files(work, [e])
-                target = work / src.name
-                checks.check("standard add: the redist arrives as a folder of its own",
-                             target.is_dir() and got == [src.name],
-                             f"{got} -> dir={target.is_dir()}")
-                checks.check("standard add: named ~Common Redist, tilde and all",
-                             target.name == "~Common Redist", target.name)
-                inside = sorted(p.relative_to(target).as_posix()
-                                for p in target.rglob("*") if p.is_file())
-                checks.check("standard add: the whole folder comes, not one file",
-                             len(inside) > 1, f"{len(inside)} file(s)")
-                _shutil.rmtree(target, ignore_errors=True)
-            else:
-                got = uc.add_files(work, [e])
-                checks.check("standard add: the readme arrives as a file",
-                             (work / src.name).is_file() and got == [src.name], str(got))
+        fake_redist = work / "source" / "~Common Redist"
+        fake_redist.mkdir(parents=True)
+        for n in ("vcredist_x64.exe", "vcredist_x86.exe", "dxwebsetup.exe"):
+            (fake_redist / n).write_text("x", encoding="utf-8")
+        fake_readme = work / "source" / "ReadME.txt"
+        fake_readme.write_text("read me", encoding="utf-8")
+
+        real_env = {k: os.environ.get(k) for k in ("UC_REDIST", "UC_README")}
+        os.environ["UC_REDIST"] = str(fake_redist)
+        os.environ["UC_README"] = str(fake_readme)
+        try:
+            resolved = uc.standard_add(list(uc.DEFAULT_ADD))
+            got = uc.add_files(work, resolved)
+            target = work / "~Common Redist"
+            checks.check("standard add: the redist arrives as a folder of its own",
+                         target.is_dir() and "~Common Redist" in got, str(got))
+            checks.check("standard add: named ~Common Redist, tilde and all",
+                         target.name == "~Common Redist", target.name)
+            inside = sorted(p.relative_to(target).as_posix()
+                            for p in target.rglob("*") if p.is_file())
+            checks.check("standard add: the whole folder comes, not one file",
+                         len(inside) == 3, f"{len(inside)} file(s)")
+            checks.check("standard add: the readme arrives as a file",
+                         (work / "ReadME.txt").read_text(encoding="utf-8") == "read me",
+                         str(sorted(p.name for p in work.iterdir())))
+        finally:
+            for key, value in real_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
         # A missing entry stops the run, including the standard set. It used to
         # be a warning for the standard set, which is how a release came out
